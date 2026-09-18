@@ -1,0 +1,50 @@
+[package]
+name = "genomic-attribute-index"
+version = "0.1.0"
+edition = "2024"
+description = "Deterministic GFF Name Index (GNI) builder and indexed query library"
+license = "Apache-2.0"
+
+[lib]
+name = "gni"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gen"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+crc32fast = "1.4"
+fst = "0.4"
+memmap2 = "0.9"
+noodles = { version = "0.101", features = ["bgzf", "core", "csi", "gff", "tabix"] }
+rayon = "1.11"
+sha2 = "0.10"
+thiserror = "2.0"
+zstd = "0.13"
+
+[dev-dependencies]
+tempfile = "3.20"
+
+[[bench]]
+name = "compression"
+harness = false
+test = false
+
+[[bench]]
+name = "build-performance"
+harness = false
+test = false
+
+[[bench]]
+name = "query-performance"
+harness = false
+test = false
+
+[profile.release]
+opt-level = 3
+strip = "symbols"
+lto = true
+codegen-units = 1
+panic = "abort"
