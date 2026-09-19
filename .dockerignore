@@ -1,0 +1,10 @@
+.git
+.gitignore
+.venv
+target
+python/target
+python/.venv
+python/dist
+**/__pycache__
+**/.pytest_cache
+fixtures

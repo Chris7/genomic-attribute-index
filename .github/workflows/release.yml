@@ -1,0 +1,223 @@
+name: Publish release artifacts
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Version tag to build, such as v0.1.0
+        required: true
+        type: string
+      publish:
+        description: Publish crates.io and PyPI artifacts after verification
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.release.tag_name || inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag || github.ref_name }}
+
+jobs:
+  verify:
+    name: Verify release version and Rust package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag || github.ref_name }}
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-06-26
+          components: rustfmt, clippy
+      - name: Check synchronized versions
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import re
+          import subprocess
+
+          tag = os.environ["RELEASE_TAG"]
+          expected = tag.removeprefix("v")
+          metadata = json.loads(subprocess.check_output(["cargo", "metadata", "--format-version", "1", "--no-deps"]))
+          root = next(package for package in metadata["packages"] if package["name"] == "genomic-attribute-index")
+          python_metadata = json.loads(subprocess.check_output([
+              "cargo", "metadata", "--manifest-path", "python/Cargo.toml",
+              "--format-version", "1", "--no-deps",
+          ]))
+          python_crate = next(package for package in python_metadata["packages"] if package["name"] == "gni-python")
+          pyproject = pathlib.Path("python/pyproject.toml").read_text()
+          python_version = re.search(r'^version = "([^"]+)"$', pyproject, re.MULTILINE).group(1)
+          if root["version"] != expected or python_crate["version"] != expected or python_version != expected:
+              raise SystemExit(
+                  f"tag {expected!r} does not match Rust {root['version']!r}, "
+                  f"Python crate {python_crate['version']!r}, and Python {python_version!r}"
+              )
+          PY
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --all-targets --all-features
+      - run: cargo doc --locked --all-features --no-deps
+      - run: cargo build --locked --release --all-features
+      - run: cargo package --locked
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cargo-package
+          path: target/package/*.crate
+
+  python-sdist:
+    name: Build Python source distribution
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag || github.ref_name }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-06-26
+      - name: Verify Python lockfile before sdist
+        run: cargo metadata --manifest-path python/Cargo.toml --locked --format-version 1 --no-deps
+      - uses: PyO3/maturin-action@86b9d133d34bc1b40018696f782949dac11bd380
+        with:
+          command: sdist
+          maturin-version: v1.11.5
+          args: --manifest-path python/Cargo.toml --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-sdist
+          path: dist/*.tar.gz
+      - name: Verify source distribution installation
+        run: |
+          python3 -m venv /tmp/gni-sdist-venv
+          /tmp/gni-sdist-venv/bin/python -m pip install --upgrade pip
+          /tmp/gni-sdist-venv/bin/python -m pip install dist/*.tar.gz
+          /tmp/gni-sdist-venv/bin/python - <<'PY'
+          import os
+          import gni
+          expected = os.environ["RELEASE_TAG"].removeprefix("v")
+          if gni.__version__ != expected:
+              raise SystemExit(f"runtime version {gni.__version__!r} != {expected!r}")
+          print(gni.__version__)
+          PY
+
+  python-wheels:
+    name: Build Python wheel (${{ matrix.os }})
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-15-intel, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag || github.ref_name }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-06-26
+      - uses: PyO3/maturin-action@86b9d133d34bc1b40018696f782949dac11bd380
+        with:
+          command: build
+          maturin-version: v1.11.5
+          args: --manifest-path python/Cargo.toml --release --locked --features abi3,extension-module --compatibility pypi --out dist
+      - name: Smoke-test wheel
+        shell: python
+        run: |
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          wheel = next(Path("dist").glob("*.whl"))
+          subprocess.check_call([
+              sys.executable, "-m", "pip", "install", "--disable-pip-version-check",
+              "--force-reinstall", str(wheel),
+          ])
+          subprocess.check_call([
+              sys.executable, "-c", "import gni; print(gni.__version__)",
+          ])
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-wheels-${{ matrix.os }}
+          path: dist/*.whl
+
+  python-wheel-test:
+    name: Test Linux Python wheel
+    needs: [verify, python-wheels]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag || github.ref_name }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-06-26
+      - uses: actions/download-artifact@v4
+        with:
+          name: python-wheels-ubuntu-latest
+          path: dist
+      - name: Install and test wheel
+        run: |
+          python -m pip install --disable-pip-version-check pytest dist/*.whl
+          pytest -q python/tests
+
+  publish-crates:
+    name: Publish crate
+    needs: [verify, python-sdist, python-wheels, python-wheel-test]
+    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.publish == true)
+    runs-on: ubuntu-latest
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag || github.ref_name }}
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-06-26
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      - name: Publish genomic-attribute-index
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish --locked
+
+  publish-pypi:
+    name: Publish Python package
+    needs: [verify, python-sdist, python-wheels, python-wheel-test]
+    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.publish == true)
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: python-*
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist

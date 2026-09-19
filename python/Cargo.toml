@@ -1,0 +1,24 @@
+[package]
+name = "gni-python"
+version = "0.1.0"
+edition = "2024"
+description = "Python bindings for the GFF Name Index"
+repository = "https://github.com/Chris7/genomic-attribute-index"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "_gni"
+crate-type = ["cdylib"]
+
+[features]
+default = []
+abi3 = ["pyo3/abi3-py310"]
+extension-module = ["pyo3/extension-module"]
+
+[dependencies]
+gni = { package = "genomic-attribute-index", version = "0.1.0", path = ".." }
+pyo3 = { version = "0.25.1", features = ["multiple-pymethods"] }
+
+[workspace]
+members = ["."]

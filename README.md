@@ -15,14 +15,20 @@ searchable only when passed explicitly with `--attribute ID`. GNI does not
 group records into semantic features, infer relationships, create hashes, or
 store BGZF virtual offsets.
 
-## Building and querying
+## Building and querying with Rust
 
 ```console
-$ gen gff index-names annotations.gff3.gz \
+$ gni build-index annotations.gff3.gz \
     --attribute Name --attribute Alias --attribute gene_name
-$ gen gff query-name annotations.gff3.gz BRCA1
-$ gen gff inspect-name-index annotations.gff3.gz.gni
+$ gni query-index annotations.gff3.gz BRCA1
+$ gni inspect-index annotations.gff3.gz.gni
 ```
+
+The `gni` binary has exactly three top-level subcommands: `build-index`,
+`query-index`, and `inspect-index`. A coordinate index is discovered from an
+unambiguous sibling `.tbi` or `.csi`; pass `--coordinate-index` when both are
+present or when the index has a nonstandard name. Query output is lossless GFF3
+record text on stdout, while build progress and phase timings go to stderr.
 
 `--attribute` is repeatable and required. The builder deduplicates repeated
 names while preserving their first deterministic occurrence. `--coordinate-index`
@@ -208,7 +214,7 @@ blocks. `IndexedGff::open` additionally checks all three fingerprints and
 rejects stale source/index pairs. Writes use a same-directory temporary file,
 `fsync`, and atomic rename.
 
-`gen gff inspect-name-index` reports selected span encodings, the block target,
+`gni inspect-index` reports selected span encodings, the block target,
 section sizes, uncompressed/compressed block totals and their ratios, and
 independent zstd-block counts. `NameIndexReader::open_mmap` is available when
 callers want the fixed directories and FST backed directly by an operating-
@@ -269,3 +275,86 @@ single-stream. Exact source and coordinate-index fingerprints are retained.
 The public reader currently uses a small per-call decode path rather than an
 optional LRU cache. Query retrieval expects BGZF source data when using a
 TBI/CSI index.
+
+## Python package
+
+The optional `genomic-attribute-index` Python package (imported as `gni`) is a PyO3/ABI3 extension built from
+`python/`. It returns structured `GffRecord`, `IndexMetadata`, `BuildStats`,
+and `QueryStats` objects, and maps stale/corrupt/input/I/O failures to typed
+exceptions. Long Rust build, open, and query operations release the GIL.
+
+Install a published wheel or build an editable checkout:
+
+```console
+python -m venv .venv
+. .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install genomic-attribute-index  # published wheel
+
+# or, from a checkout:
+python -m pip install maturin pytest
+maturin develop --manifest-path python/Cargo.toml --features abi3,extension-module
+pytest -q python/tests
+```
+
+Example API usage:
+
+```python
+from pathlib import Path
+import gni
+
+source = Path("annotations.gff3.gz")
+tbi = Path("annotations.gff3.gz.tbi")
+stats = gni.build_index(source, tbi, Path("annotations.gff3.gz.gni"), ["Name", "Alias"])
+indexed = gni.open_index(source, tbi, Path("annotations.gff3.gz.gni"))
+for record in indexed.query("BRCA1"):
+    print(record.reference_sequence_name, record.start, record.attributes)
+print(indexed.metadata().term_count, stats.records_processed)
+```
+
+The package's deterministic fixture helper creates both TBI and CSI test
+indexes. To run the same installed-extension suite locally, use
+`maturin develop` followed by `pytest -q python/tests`; the tests do not mock
+the extension.
+
+## Docker development
+
+The repository pins Rust nightly-2026-06-26 in `rust-toolchain.toml`; the root
+Dockerfile uses a reproducible Rust 1.98 base and installs that same pinned
+toolchain, then runs the locked all-target test suite and starts a non-root
+shell:
+
+```console
+docker build --build-arg RUST_VERSION=1.98.0 \
+  --build-arg RUST_TOOLCHAIN=nightly-2026-06-26 -t gni:rust-dev .
+docker run --rm -it gni:rust-dev
+```
+
+The Python development image builds the ABI3 wheel and runs pytest by default.
+Its build context is the repository root so the Python crate's path dependency
+on the Rust library resolves correctly:
+
+```console
+docker build -f python/Dockerfile --build-arg RUST_VERSION=1.98.0 \
+  --build-arg RUST_TOOLCHAIN=nightly-2026-06-26 -t gni:python-dev .
+docker run --rm gni:python-dev
+```
+
+## CI and releases
+
+`.github/workflows/ci.yml` runs Rust formatting, clippy, all-target tests,
+documentation, release builds, `cargo package`, and a Python 3.10--3.14
+wheel/test matrix. `docker.yml` validates both Dockerfiles on pushes and pull
+requests. Cargo and Python dependency caches are keyed by the checked-in lock
+files, and build/package jobs use locked resolution.
+
+`release.yml` is intentionally gated: a published GitHub release runs the
+verification and artifact jobs, while `workflow_dispatch` defaults to
+build-only and requires the `publish` boolean to be enabled for publication.
+The `vX.Y.Z` tag must match the root Cargo version, the Python crate version,
+and `python/pyproject.toml`. The crates.io job uses the `crates-io-auth-action`
+OIDC exchange and the `crates-io` environment; the PyPI job uses trusted
+publishing with the `pypi` environment and `id-token: write`. Configure those
+two repository environments with the corresponding crates.io and PyPI trusted
+publisher policies before enabling publication. No package is published from
+pull requests.

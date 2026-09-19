@@ -1,0 +1,39 @@
+name: Docker builds
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build Rust development image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          tags: gni:rust-dev
+          push: false
+          load: false
+      - name: Build Python development image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: python/Dockerfile
+          tags: gni:python-dev
+          push: false
+          load: true
+      - name: Run Python tests in development image
+        run: docker run --rm gni:python-dev

@@ -53,15 +53,14 @@ fn cli_index_query_and_inspect() {
     let directory = tempdir().expect("should create temp directory");
     let (source, coordinate_index) = write_fixture(directory.path());
     let destination = directory.path().join("cli.gni");
-    let binary = env!("CARGO_BIN_EXE_gen");
+    let binary = env!("CARGO_BIN_EXE_gni");
     let source = source.to_string_lossy().into_owned();
     let coordinate_index = coordinate_index.to_string_lossy().into_owned();
     let destination_string = destination.to_string_lossy().into_owned();
 
     let indexed = Command::new(binary)
         .args([
-            "gff",
-            "index-names",
+            "build-index",
             &source,
             "--attribute",
             "Name",
@@ -71,7 +70,7 @@ fn cli_index_query_and_inspect() {
             &destination_string,
         ])
         .output()
-        .expect("should run gen index-names");
+        .expect("should run gni build-index");
     assert!(indexed.status.success(), "stderr: {:?}", indexed.stderr);
     assert!(destination.exists());
     assert!(String::from_utf8_lossy(&indexed.stdout).contains("wrote"));
@@ -81,8 +80,7 @@ fn cli_index_query_and_inspect() {
 
     let queried = Command::new(binary)
         .args([
-            "gff",
-            "query-name",
+            "query-index",
             &source,
             "BRCA1",
             "--coordinate-index",
@@ -91,7 +89,7 @@ fn cli_index_query_and_inspect() {
             &destination_string,
         ])
         .output()
-        .expect("should run gen query-name");
+        .expect("should run gni query-index");
     assert!(queried.status.success(), "stderr: {:?}", queried.stderr);
     assert_eq!(
         String::from_utf8_lossy(&queried.stdout).trim(),
@@ -99,9 +97,9 @@ fn cli_index_query_and_inspect() {
     );
 
     let inspected = Command::new(binary)
-        .args(["gff", "inspect-name-index", &destination_string])
+        .args(["inspect-index", &destination_string])
         .output()
-        .expect("should run gen inspect-name-index");
+        .expect("should run gni inspect-index");
     assert!(inspected.status.success(), "stderr: {:?}", inspected.stderr);
     let inspection = String::from_utf8_lossy(&inspected.stdout);
     assert!(inspection.contains("zero-based half-open"));
@@ -111,14 +109,30 @@ fn cli_index_query_and_inspect() {
 
     let missing_attribute = Command::new(binary)
         .args([
-            "gff",
-            "index-names",
+            "build-index",
             &source,
             "--coordinate-index",
             &coordinate_index,
         ])
         .output()
-        .expect("should run invalid gen command");
+        .expect("should run invalid build command");
     assert!(!missing_attribute.status.success());
     assert!(String::from_utf8_lossy(&missing_attribute.stderr).contains("attribute"));
+
+    let help = Command::new(binary)
+        .arg("--help")
+        .output()
+        .expect("should run gni help");
+    assert!(help.status.success());
+    let help = String::from_utf8_lossy(&help.stdout);
+    assert!(help.contains("build-index"));
+    assert!(help.contains("query-index"));
+    assert!(help.contains("inspect-index"));
+    assert!(!help.contains("gff"));
+
+    let old_surface = Command::new(binary)
+        .args(["gff", "query-name", &source, "BRCA1"])
+        .output()
+        .expect("should run removed command check");
+    assert!(!old_surface.status.success());
 }

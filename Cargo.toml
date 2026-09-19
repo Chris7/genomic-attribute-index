@@ -4,13 +4,28 @@ version = "0.1.0"
 edition = "2024"
 description = "Deterministic GFF Name Index (GNI) builder and indexed query library"
 license = "Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/Chris7/genomic-attribute-index"
+keywords = ["gff", "bioinformatics", "genomics", "index"]
+categories = ["science", "command-line-utilities"]
+include = [
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    "src/**",
+    "examples/**",
+    "benches/**",
+    "docs/**",
+    "tests/**",
+    "LICENSE*",
+]
 
 [lib]
 name = "gni"
 path = "src/lib.rs"
 
 [[bin]]
-name = "gen"
+name = "gni"
 path = "src/main.rs"
 
 [dependencies]
