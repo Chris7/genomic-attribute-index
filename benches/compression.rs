@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use gni::{IndexedGff, NameIndexOptions, build_name_index_with_span_block_size};
+use gai::{IndexedGff, NameIndexOptions, build_name_index_with_span_block_size};
 use noodles::{
     bgzf,
     core::Position,
@@ -30,10 +30,12 @@ struct SyntheticRecord {
 #[derive(Clone, Copy)]
 struct BlockMeasurement {
     block_size: usize,
-    structural_bytes: u64,
-    compressed_bytes: u64,
+    starts_structural_bytes: u64,
+    starts_compressed_bytes: u64,
+    lengths_structural_bytes: u64,
+    lengths_compressed_bytes: u64,
     block_count: u64,
-    gni_bytes: u64,
+    gai_bytes: u64,
     lookup_bytes: u64,
     lookup_latency: Duration,
 }
@@ -73,13 +75,105 @@ fn for_stream(values: &[u64]) -> Vec<u8> {
     output
 }
 
+fn length_payload(lengths: &[u64]) -> Vec<u8> {
+    let mut varints = Vec::new();
+    for &length in lengths {
+        varint(length, &mut varints);
+    }
+    let base = lengths.iter().copied().min().unwrap_or(0);
+    let frame = for_stream(lengths);
+    let maximum = lengths
+        .iter()
+        .map(|value| value.saturating_sub(base))
+        .max()
+        .unwrap_or(0);
+    let width = if maximum == 0 {
+        0
+    } else {
+        (64 - maximum.leading_zeros()) as u8
+    };
+    let use_frame = width <= 63 && frame.len() < varints.len();
+    let (encoding, stream, base, width) = if use_frame {
+        (2_u8, frame, base, width)
+    } else {
+        (0_u8, varints, 0, 0)
+    };
+    let mut payload = Vec::with_capacity(20 + stream.len());
+    payload.extend_from_slice(&(lengths.len() as u32).to_le_bytes());
+    payload.push(encoding);
+    payload.push(width);
+    payload.extend_from_slice(&[0; 2]);
+    payload.extend_from_slice(&base.to_le_bytes());
+    payload.extend_from_slice(&(stream.len() as u32).to_le_bytes());
+    payload.extend_from_slice(&stream);
+    payload
+}
+
+#[derive(Clone, Copy, Default)]
+struct CombinedSpanMeasurement {
+    raw_bytes: u64,
+    compressed_bytes: u64,
+    zstd_blocks: u64,
+    block_count: u64,
+}
+
+/// Measures a hypothetical combined span-data section without changing GAI's
+/// split layout. Each block concatenates canonical delta starts and the exact
+/// adaptive length payload used by GAI; the row count and length header make
+/// the boundary unambiguous. The projection below also accounts for a 52-byte
+/// combined block-directory entry and one fewer 40-byte section-directory
+/// entry.
+fn measure_combined_span_blocks(spans: &[Span], spans_per_block: usize) -> CombinedSpanMeasurement {
+    let mut measurement = CombinedSpanMeasurement::default();
+    let mut block_start = 0;
+    while block_start < spans.len() {
+        let reference = spans[block_start].reference;
+        let mut block_end = block_start;
+        while block_end < spans.len()
+            && spans[block_end].reference == reference
+            && block_end - block_start < spans_per_block
+        {
+            block_end += 1;
+        }
+        let block = &spans[block_start..block_end];
+        let mut starts = Vec::new();
+        let mut previous = block[0].start;
+        for span in block.iter().skip(1) {
+            varint(
+                span.start
+                    .checked_sub(previous)
+                    .expect("synthetic starts are coordinate sorted"),
+                &mut starts,
+            );
+            previous = span.start;
+        }
+        let lengths = block.iter().map(|span| span.length).collect::<Vec<_>>();
+        let lengths = length_payload(&lengths);
+        let mut combined = Vec::with_capacity(starts.len() + lengths.len());
+        combined.extend_from_slice(&starts);
+        combined.extend_from_slice(&lengths);
+        let compressed =
+            zstd::bulk::compress(&combined, 3).expect("zstd should compress combined span payload");
+        measurement.raw_bytes += combined.len() as u64;
+        if compressed.len() < combined.len() {
+            measurement.compressed_bytes += compressed.len() as u64;
+            measurement.zstd_blocks += 1;
+        } else {
+            measurement.compressed_bytes += combined.len() as u64;
+        }
+        measurement.block_count += 1;
+        block_start = block_end;
+    }
+    measurement
+}
+
 fn measure_queries(
     source_path: &std::path::Path,
     coordinate_index_path: &std::path::Path,
-    gni_path: &std::path::Path,
+    gai_path: &std::path::Path,
     query_terms: &[String],
 ) -> (u64, Duration) {
-    let mut reader = IndexedGff::open(source_path, coordinate_index_path, gni_path)
+    let mut reader = IndexedGff::open(source_path, coordinate_index_path, gai_path)
         .expect("should open synthetic indexed GFF");
     let started = Instant::now();
     let mut lookup_bytes = 0_u64;
@@ -204,7 +298,7 @@ fn main() {
             previous_start = span.start;
             previous_reference = Some(span.reference);
             // The first start for each reference is represented in the
-            // reference-local block directory, matching the GNI layout.
+            // reference-local block directory, matching the GAI layout.
             continue;
         }
         varint(span.start - previous_start, &mut columnar);
@@ -317,7 +411,7 @@ fn main() {
     let mut selected_stats = None;
     let mut selected_metadata = None;
     for block_size in [1_024_usize, 4_096, 16_384] {
-        let block_path = directory.path().join(format!("synthetic-{block_size}.gni"));
+        let block_path = directory.path().join(format!("synthetic-{block_size}.gai"));
         let block_stats = build_name_index_with_span_block_size(
             &source_path,
             &coordinate_index_path,
@@ -325,9 +419,9 @@ fn main() {
             &options,
             block_size,
         )
-        .expect("should build synthetic GNI");
-        let block_metadata = gni::NameIndexReader::open(&block_path)
-            .expect("should open synthetic block-size GNI")
+        .expect("should build synthetic GAI");
+        let block_metadata = gai::NameIndexReader::open(&block_path)
+            .expect("should open synthetic block-size GAI")
             .inspect();
         let (lookup_bytes, lookup_latency) = measure_queries(
             &source_path,
@@ -337,10 +431,12 @@ fn main() {
         );
         block_measurements.push(BlockMeasurement {
             block_size,
-            structural_bytes: block_stats.span_bytes_structural,
-            compressed_bytes: block_stats.span_bytes_after_compression,
+            starts_structural_bytes: block_stats.span_starts_bytes_before_compression,
+            starts_compressed_bytes: block_stats.span_starts_bytes_after_compression,
+            lengths_structural_bytes: block_stats.span_lengths_bytes_before_compression,
+            lengths_compressed_bytes: block_stats.span_lengths_bytes_after_compression,
             block_count: block_metadata.span_block_count,
-            gni_bytes: block_stats.index_bytes,
+            gai_bytes: block_stats.index_bytes,
             lookup_bytes,
             lookup_latency,
         });
@@ -351,18 +447,40 @@ fn main() {
     }
     for measurement in block_measurements {
         println!(
-            "span blocks {}: structural {}, zstd {}, blocks {}, GNI bytes {}, avg lookup bytes {}, avg lookup latency {:?}",
+            "span blocks {}: starts raw {}, starts zstd {}, lengths raw {}, lengths zstd {}, blocks {}, GAI bytes {}, avg lookup bytes {}, avg lookup latency {:?}",
             measurement.block_size,
-            measurement.structural_bytes,
-            measurement.compressed_bytes,
+            measurement.starts_structural_bytes,
+            measurement.starts_compressed_bytes,
+            measurement.lengths_structural_bytes,
+            measurement.lengths_compressed_bytes,
             measurement.block_count,
-            measurement.gni_bytes,
+            measurement.gai_bytes,
             measurement.lookup_bytes,
             measurement.lookup_latency
         );
     }
     let stats = selected_stats.expect("selected block size should be measured");
     let metadata = selected_metadata.expect("selected block metadata should be available");
+    let combined = measure_combined_span_blocks(&unique_spans, 4_096);
+    assert_eq!(
+        combined.raw_bytes,
+        metadata
+            .starts_uncompressed_bytes
+            .checked_add(metadata.lengths_uncompressed_bytes)
+            .expect("span raw size should fit")
+    );
+    let combined_directory_bytes = combined.block_count * 52;
+    let combined_section_directory_bytes = 6 * 40;
+    let split_section_directory_bytes = 7 * 40;
+    let projected_combined_gai_bytes = stats
+        .index_bytes
+        .checked_sub(metadata.starts_data_bytes + metadata.lengths_data_bytes)
+        .and_then(|value| value.checked_sub(metadata.span_directory_bytes))
+        .and_then(|value| value.checked_sub(split_section_directory_bytes))
+        .and_then(|value| value.checked_add(combined.compressed_bytes))
+        .and_then(|value| value.checked_add(combined_directory_bytes))
+        .and_then(|value| value.checked_add(combined_section_directory_bytes))
+        .expect("combined GAI projection should fit");
     println!("query terms (all known): {}", query_terms.len());
     println!("uncompressed GFF bytes: {}", uncompressed_gff_bytes);
     println!(
@@ -376,10 +494,85 @@ fn main() {
             .expect("TBI metadata")
             .len()
     );
-    println!("GNI bytes: {}", stats.index_bytes);
+    println!("GAI bytes: {}", stats.index_bytes);
+    println!(
+        "split span payload raw/compressed: {}/{}",
+        metadata.starts_uncompressed_bytes + metadata.lengths_uncompressed_bytes,
+        metadata.starts_data_bytes + metadata.lengths_data_bytes
+    );
+    println!(
+        "combined span payload raw/compressed: {}/{}, zstd blocks {}, directory bytes {}, projected GAI bytes {}",
+        combined.raw_bytes,
+        combined.compressed_bytes,
+        combined.zstd_blocks,
+        combined_directory_bytes,
+        projected_combined_gai_bytes
+    );
+    println!(
+        "combined size delta vs split: {} bytes ({:.2}%)",
+        projected_combined_gai_bytes as i64 - stats.index_bytes as i64,
+        (projected_combined_gai_bytes as f64 / stats.index_bytes as f64 - 1.0) * 100.0
+    );
+    let real_fixture = std::path::Path::new("fixtures/gencode_sorted.gff.gz.gai");
+    if real_fixture.exists() {
+        let real_reader = gai::NameIndexReader::open(real_fixture)
+            .expect("checked-in GAI fixture should open for comparison");
+        let real_metadata = real_reader.inspect();
+        let real_span_ids = (0..real_metadata.unique_span_count).collect::<Vec<_>>();
+        let real_spans = real_reader
+            .resolve_span_ids(&real_span_ids)
+            .expect("checked-in GAI spans should resolve")
+            .into_iter()
+            .map(|span| Span {
+                reference: span.reference_id,
+                start: span.start,
+                length: span.length,
+            })
+            .collect::<Vec<_>>();
+        let real_combined =
+            measure_combined_span_blocks(&real_spans, real_metadata.span_block_size as usize);
+        let real_combined_directory_bytes = real_combined.block_count * 52;
+        let real_projected = real_metadata
+            .file_size
+            .checked_sub(real_metadata.starts_data_bytes + real_metadata.lengths_data_bytes)
+            .and_then(|value| value.checked_sub(real_metadata.span_directory_bytes))
+            .and_then(|value| value.checked_sub(7 * 40))
+            .and_then(|value| value.checked_add(real_combined.compressed_bytes))
+            .and_then(|value| value.checked_add(real_combined_directory_bytes))
+            .and_then(|value| value.checked_add(6 * 40))
+            .expect("real combined GAI projection should fit");
+        let (_, real_lookup) = real_reader
+            .lookup_spans_with_stats("brca1")
+            .expect("real BRCA1 lookup should resolve");
+        println!(
+            "real GENCODE split bytes {}, starts raw/compressed {}/{}, lengths raw/compressed {}/{}, zstd blocks {}/{}, span blocks {}, combined raw/compressed {}/{}, combined zstd blocks {}, combined directory bytes {}, projected combined bytes {}, split BRCA1 decoded bytes {}, combined BRCA1 decoded bytes {}",
+            real_metadata.file_size,
+            real_metadata.starts_uncompressed_bytes,
+            real_metadata.starts_data_bytes,
+            real_metadata.lengths_uncompressed_bytes,
+            real_metadata.lengths_data_bytes,
+            real_metadata.compressed_start_blocks,
+            real_metadata.compressed_length_blocks,
+            real_combined.block_count,
+            real_combined.raw_bytes,
+            real_combined.compressed_bytes,
+            real_combined.zstd_blocks,
+            real_combined_directory_bytes,
+            real_projected,
+            real_lookup.postings_bytes_decompressed + real_lookup.span_bytes_decompressed,
+            real_lookup.postings_bytes_decompressed + real_lookup.span_bytes_decompressed
+        );
+    }
     println!("FST bytes: {}", metadata.term_dictionary_bytes);
     println!("postings bytes: {}", metadata.postings_data_bytes);
-    println!("span-table bytes: {}", metadata.span_data_bytes);
+    println!(
+        "span component bytes (starts/lengths): {}/{}",
+        metadata.starts_data_bytes, metadata.lengths_data_bytes
+    );
+    println!(
+        "span component uncompressed bytes (starts/lengths): {}/{}",
+        metadata.starts_uncompressed_bytes, metadata.lengths_uncompressed_bytes
+    );
     println!(
         "block-directory bytes: {}",
         metadata.postings_directory_bytes + metadata.span_directory_bytes

@@ -1,19 +1,20 @@
-"""Python API for the deterministic GFF Name Index.
+"""Python API for the deterministic Genomic Attribute Index.
 
 The heavy build and query work runs in Rust and releases the GIL. Paths may be
 strings or :class:`pathlib.Path` instances.
 """
 
 from importlib.metadata import PackageNotFoundError, version
+from typing import Literal
 
-from ._gni import (
+from ._gai import (
     BuildStats,
     GffRecord,
-    GniCorruptError,
-    GniError,
-    GniInputError,
-    GniIoError,
-    GniStaleError,
+    GaiCorruptError,
+    GaiError,
+    GaiInputError,
+    GaiIoError,
+    GaiStaleError,
     IndexMetadata,
     IndexedGff,
     QueryStats,
@@ -26,19 +27,22 @@ from ._gni import (
 __all__ = [
     "BuildStats",
     "GffRecord",
-    "GniCorruptError",
-    "GniError",
-    "GniInputError",
-    "GniIoError",
-    "GniStaleError",
+    "GaiCorruptError",
+    "GaiError",
+    "GaiInputError",
+    "GaiIoError",
+    "GaiStaleError",
     "IndexMetadata",
     "IndexedGff",
+    "MatchMode",
     "QueryStats",
     "build_index",
     "inspect_index",
     "open_index",
     "query_index",
 ]
+
+MatchMode = Literal["exact", "prefix"]
 try:
     __version__ = version("genomic-attribute-index")
 except PackageNotFoundError:
@@ -58,7 +62,7 @@ def build_index(
     compression_threads=None,
     bgzf_threads=None,
 ) -> BuildStats:
-    """Build a GNI beside a BGZF or plain GFF3 source.
+    """Build a GAI beside a BGZF or plain GFF3 source.
 
     ``attributes`` is a nonempty iterable of explicit GFF3 attribute tags.
     Duplicate tags are removed while preserving first occurrence. The result
@@ -76,16 +80,22 @@ def build_index(
     )
 
 
-def open_index(input, coordinate_index, gni) -> IndexedGff:
-    """Open a source, TBI/CSI index, and matching GNI with stale checks."""
-    return _open_index(input, coordinate_index, gni)
+def open_index(input, coordinate_index, gai) -> IndexedGff:
+    """Open a source, TBI/CSI index, and matching GAI with stale checks."""
+    return _open_index(input, coordinate_index, gai)
 
 
-def query_index(input, coordinate_index, gni, term: str) -> list[GffRecord]:
-    """Open an indexed source and return records matching ``term``."""
-    return _query_index(input, coordinate_index, gni, term)
+def query_index(
+    input, coordinate_index, gai, term: str, *, match: MatchMode = "exact"
+) -> list[GffRecord]:
+    """Open an indexed source and return records matching ``term``.
+
+    ``match`` is either ``"exact"`` (the default) or ``"prefix"``. Values
+    are normalized before the selected comparison is applied.
+    """
+    return _query_index(input, coordinate_index, gai, term, match=match)
 
 
-def inspect_index(gni) -> IndexMetadata:
-    """Read format and compression metadata from a GNI file."""
-    return _inspect_index(gni)
+def inspect_index(gai) -> IndexMetadata:
+    """Read format and compression metadata from a GAI file."""
+    return _inspect_index(gai)

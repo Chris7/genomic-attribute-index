@@ -37,8 +37,8 @@ RUN touch src/lib.rs src/main.rs python/src/lib.rs \
         --features abi3,extension-module --compatibility pypi --out /tmp/wheels \
     && pip install --no-cache-dir /tmp/wheels/*.whl \
     && pytest -q python/tests \
-    && useradd --create-home --shell /bin/bash gni \
-    && chown -R gni:gni /workspace /opt/venv
+    && useradd --create-home --shell /bin/bash gai \
+    && chown -R gai:gai /workspace /opt/venv
 
-USER gni
+USER gai
 CMD ["pytest", "-q", "python/tests"]

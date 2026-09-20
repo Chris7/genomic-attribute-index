@@ -259,6 +259,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7ab85b9b05e3978cc9a9cf8fea7f01b494e1a09ed3037e16ba39edc7a29eb61a"
 
 [[package]]
+name = "gai-python"
+version = "0.1.0"
+dependencies = [
+ "genomic-attribute-index",
+ "pyo3",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -292,14 +300,6 @@ dependencies = [
  "cfg-if",
  "libc",
  "r-efi",
-]
-
-[[package]]
-name = "gni-python"
-version = "0.1.0"
-dependencies = [
- "genomic-attribute-index",
- "pyo3",
 ]
 
 [[package]]

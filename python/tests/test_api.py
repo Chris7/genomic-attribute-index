@@ -4,17 +4,17 @@ from pathlib import Path
 
 import pytest
 
-import gni
+import gai
 
 
 def test_distribution_version_is_exposed():
-    assert gni.__version__ == "0.1.0"
+    assert gai.__version__ == "0.1.0"
 
 
 def _build(
     paths: dict[str, Path], output: Path, *, case_sensitive: bool = False
-) -> gni.BuildStats:
-    return gni.build_index(
+) -> gai.BuildStats:
+    return gai.build_index(
         paths["source"],
         paths["tbi"],
         output,
@@ -27,17 +27,18 @@ def _build(
 
 
 def test_build_query_inspect_tbi_and_source_order(fixture_paths, tmp_path):
-    destination = tmp_path / "fixture.gni"
+    destination = tmp_path / "fixture.gai"
     stats = _build(fixture_paths, destination)
     assert stats.records_processed == 5
     assert stats.records_indexed == 5
     assert stats.distinct_terms >= 4
     assert stats.total_seconds >= 0
 
-    indexed = gni.open_index(fixture_paths["source"], fixture_paths["tbi"], destination)
+    indexed = gai.open_index(fixture_paths["source"], fixture_paths["tbi"], destination)
     metadata = indexed.metadata()
     assert metadata.attributes == ["Name", "Alias"]
     assert metadata.major_version == 1
+    assert metadata.minor_version == 0
     assert len(metadata.gff_fingerprint) == 64
 
     records, query_stats = indexed.query_with_stats(" ALPHA ")
@@ -52,20 +53,49 @@ def test_build_query_inspect_tbi_and_source_order(fixture_paths, tmp_path):
     assert records[0].attribute_values("Alias") == ["Beta", "Gamma"]
     assert records[2].attributes == [("Alias", ["Alpha"])]
     assert (
-        gni.query_index(
+        gai.query_index(
             fixture_paths["source"], fixture_paths["tbi"], destination, "other gene"
         )[0].start
         == 30
     )
+    prefix_records = indexed.query("alp", match="prefix")
+    assert len(prefix_records) == 4
+    prefix_records, prefix_stats = indexed.query_with_stats("alp", match="prefix")
+    assert len(prefix_records) == 4
+    assert prefix_stats.matching_records == 4
+    assert (
+        len(
+            gai.query_index(
+                fixture_paths["source"],
+                fixture_paths["tbi"],
+                destination,
+                "alp",
+                match="prefix",
+            )
+        )
+        == 4
+    )
+    with pytest.raises(gai.GaiInputError, match="exact.*prefix"):
+        indexed.query("alp", match="substring")
+    with pytest.raises(TypeError):
+        indexed.query("alp", "prefix")
+    with pytest.raises(TypeError):
+        gai.query_index(
+            fixture_paths["source"], fixture_paths["tbi"], destination, "alp", "prefix"
+        )
 
-    inspected = gni.inspect_index(destination)
+    inspected = gai.inspect_index(destination)
     assert inspected.file_size == metadata.file_size
-    assert inspected.span_data_bytes >= 0
+    assert inspected.starts_data_bytes >= 0
+    assert inspected.lengths_data_bytes >= 0
+    assert inspected.delta_start_blocks == metadata.span_block_count
+    assert inspected.compressed_start_blocks >= 0
+    assert inspected.compressed_length_blocks >= 0
 
 
 def test_csi_case_sensitive_unknown_and_no_id(fixture_paths, tmp_path):
-    destination = tmp_path / "fixture-csi.gni"
-    gni.build_index(
+    destination = tmp_path / "fixture-csi.gai"
+    gai.build_index(
         fixture_paths["source"],
         fixture_paths["csi"],
         destination,
@@ -74,15 +104,17 @@ def test_csi_case_sensitive_unknown_and_no_id(fixture_paths, tmp_path):
         compression_threads=1,
         bgzf_threads=1,
     )
-    indexed = gni.open_index(fixture_paths["source"], fixture_paths["csi"], destination)
+    indexed = gai.open_index(fixture_paths["source"], fixture_paths["csi"], destination)
     assert len(indexed.query("Alpha")) == 4
     assert indexed.query("alpha") == []
+    assert len(indexed.query("Al", match="prefix")) == 4
+    assert indexed.query("al", match="prefix") == []
     assert indexed.query("missing") == []
 
-    id_only = tmp_path / "id-only.gni"
-    gni.build_index(fixture_paths["source"], fixture_paths["tbi"], id_only, ["ID"])
+    id_only = tmp_path / "id-only.gai"
+    gai.build_index(fixture_paths["source"], fixture_paths["tbi"], id_only, ["ID"])
     assert (
-        gni.open_index(fixture_paths["source"], fixture_paths["tbi"], id_only).query(
+        gai.open_index(fixture_paths["source"], fixture_paths["tbi"], id_only).query(
             "Alpha"
         )
         == []
@@ -90,37 +122,37 @@ def test_csi_case_sensitive_unknown_and_no_id(fixture_paths, tmp_path):
 
 
 def test_stale_corrupt_and_argument_errors(fixture_paths, tmp_path):
-    destination = tmp_path / "fixture.gni"
+    destination = tmp_path / "fixture.gai"
     _build(fixture_paths, destination)
 
     stale_source = tmp_path / "stale.gff3.gz"
     stale_source.write_bytes(fixture_paths["source"].read_bytes() + b"\n")
-    with pytest.raises(gni.GniStaleError):
-        gni.open_index(stale_source, fixture_paths["tbi"], destination)
+    with pytest.raises(gai.GaiStaleError):
+        gai.open_index(stale_source, fixture_paths["tbi"], destination)
 
-    corrupt = tmp_path / "corrupt.gni"
+    corrupt = tmp_path / "corrupt.gai"
     corrupt.write_bytes(
         destination.read_bytes()[:-1] + bytes([destination.read_bytes()[-1] ^ 0xFF])
     )
-    with pytest.raises(gni.GniCorruptError):
-        gni.inspect_index(corrupt)
+    with pytest.raises(gai.GaiCorruptError):
+        gai.inspect_index(corrupt)
 
-    with pytest.raises(gni.GniInputError):
-        gni.build_index(
-            fixture_paths["source"], fixture_paths["tbi"], tmp_path / "empty.gni", []
+    with pytest.raises(gai.GaiInputError):
+        gai.build_index(
+            fixture_paths["source"], fixture_paths["tbi"], tmp_path / "empty.gai", []
         )
-    with pytest.raises(gni.GniInputError):
-        gni.build_index(
+    with pytest.raises(gai.GaiInputError):
+        gai.build_index(
             fixture_paths["source"],
             fixture_paths["tbi"],
-            tmp_path / "bad-memory.gni",
+            tmp_path / "bad-memory.gai",
             ["Name"],
             memory_budget=0,
         )
     with pytest.raises(TypeError):
-        gni.build_index(
+        gai.build_index(
             fixture_paths["source"],
             fixture_paths["tbi"],
-            tmp_path / "bad-type.gni",
+            tmp_path / "bad-type.gai",
             [1],
         )

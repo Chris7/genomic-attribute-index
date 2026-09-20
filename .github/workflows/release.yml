@@ -55,7 +55,7 @@ jobs:
               "cargo", "metadata", "--manifest-path", "python/Cargo.toml",
               "--format-version", "1", "--no-deps",
           ]))
-          python_crate = next(package for package in python_metadata["packages"] if package["name"] == "gni-python")
+          python_crate = next(package for package in python_metadata["packages"] if package["name"] == "gai-python")
           pyproject = pathlib.Path("python/pyproject.toml").read_text()
           python_version = re.search(r'^version = "([^"]+)"$', pyproject, re.MULTILINE).group(1)
           if root["version"] != expected or python_crate["version"] != expected or python_version != expected:
@@ -102,16 +102,16 @@ jobs:
           path: dist/*.tar.gz
       - name: Verify source distribution installation
         run: |
-          python3 -m venv /tmp/gni-sdist-venv
-          /tmp/gni-sdist-venv/bin/python -m pip install --upgrade pip
-          /tmp/gni-sdist-venv/bin/python -m pip install dist/*.tar.gz
-          /tmp/gni-sdist-venv/bin/python - <<'PY'
+          python3 -m venv /tmp/gai-sdist-venv
+          /tmp/gai-sdist-venv/bin/python -m pip install --upgrade pip
+          /tmp/gai-sdist-venv/bin/python -m pip install dist/*.tar.gz
+          /tmp/gai-sdist-venv/bin/python - <<'PY'
           import os
-          import gni
+          import gai
           expected = os.environ["RELEASE_TAG"].removeprefix("v")
-          if gni.__version__ != expected:
-              raise SystemExit(f"runtime version {gni.__version__!r} != {expected!r}")
-          print(gni.__version__)
+          if gai.__version__ != expected:
+              raise SystemExit(f"runtime version {gai.__version__!r} != {expected!r}")
+          print(gai.__version__)
           PY
 
   python-wheels:
@@ -150,7 +150,7 @@ jobs:
               "--force-reinstall", str(wheel),
           ])
           subprocess.check_call([
-              sys.executable, "-c", "import gni; print(gni.__version__)",
+              sys.executable, "-c", "import gai; print(gai.__version__)",
           ])
       - uses: actions/upload-artifact@v4
         with:

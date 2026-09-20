@@ -1,11 +1,11 @@
-//! GNI, the GFF Name Index.
+//! GAI, the Genomic Attribute Index.
 //!
-//! GNI is a small, explicit binary index for configured GFF3 attribute values.
+//! GAI is a small, explicit binary index for configured GFF3 attribute values.
 //! It is intentionally not a feature-identity index: `ID` is just another
 //! attribute, and only names supplied in [`NameIndexOptions`] are searchable.
 //! Coordinates in the on-disk format are zero-based, half-open `start +
 //! length` tuples.  TBI/CSI remains responsible for locating source records;
-//! GNI stores no BGZF virtual offsets.
+//! GAI stores no BGZF virtual offsets.
 
 #[cfg(test)]
 use std::collections::BTreeSet;
@@ -25,6 +25,7 @@ use std::{
 };
 
 use bgzf::io::Seek as _;
+use fst::Automaton;
 use memmap2::Mmap;
 use noodles::{
     bgzf,
@@ -40,7 +41,7 @@ use noodles::{
 };
 use sha2::{Digest, Sha256};
 
-const MAGIC: [u8; 4] = *b"GNI\x01";
+const MAGIC: [u8; 4] = *b"GAI\x01";
 const MAJOR_VERSION: u16 = 1;
 const MINOR_VERSION: u16 = 0;
 const BYTE_ORDER_LITTLE: u8 = 1;
@@ -50,17 +51,19 @@ const NORMALIZATION_CASE_SENSITIVE: u8 = 1;
 const HEADER_SIZE: usize = 256;
 const DIRECTORY_ENTRY_SIZE: usize = 40;
 const POSTINGS_DIRECTORY_ENTRY_SIZE: usize = 32;
-const SPAN_DIRECTORY_ENTRY_SIZE: usize = 52;
+const SPAN_DIRECTORY_ENTRY_SIZE: usize = 72;
+const LENGTH_PAYLOAD_HEADER_SIZE: usize = 20;
+const START_ENCODING_DELTA: u8 = 1;
 const MAX_SECTION_BYTES: u64 = 1 << 40;
 const MAX_BLOCK_BYTES: u64 = 256 << 20;
 const DEFAULT_POSTINGS_BLOCK_TARGET: usize = 64 * 1024;
 const DEFAULT_SPANS_PER_BLOCK: usize = 4096;
 const MAX_RUN_FANIN: usize = 64;
 const PROGRESS_RECORD_INTERVAL: u64 = 250_000;
-const RUN_MAGIC: [u8; 8] = *b"GNIR\x01\x00\x00\x00";
+const RUN_MAGIC: [u8; 8] = *b"GAIR\x01\x00\x00\x00";
 static RUN_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Errors returned by GNI construction, reading, and indexed querying.
+/// Errors returned by GAI construction, reading, and indexed querying.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// A source or index file could not be read.
@@ -69,11 +72,11 @@ pub enum Error {
     /// The supplied input is malformed or inconsistent.
     #[error("invalid input: {0}")]
     InvalidInput(String),
-    /// The GNI byte stream is malformed or unsafe to decode.
-    #[error("corrupt GNI: {0}")]
+    /// The GAI byte stream is malformed or unsafe to decode.
+    #[error("corrupt GAI: {0}")]
     Corrupt(String),
-    /// The source GFF or coordinate index does not match the GNI metadata.
-    #[error("stale GNI: {0}")]
+    /// The source GFF or coordinate index does not match the GAI metadata.
+    #[error("stale GAI: {0}")]
     Stale(String),
     /// A compressed block could not be decoded.
     #[error("compression error: {0}")]
@@ -81,6 +84,30 @@ pub enum Error {
     /// A value cannot be represented in the requested coordinate type.
     #[error("invalid coordinate")]
     InvalidCoordinate,
+}
+
+/// Controls how a normalized attribute query is matched against indexed
+/// values.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MatchMode {
+    /// Match one complete normalized configured attribute value.
+    Exact,
+    /// Match every normalized configured attribute value beginning with the
+    /// normalized query.
+    Prefix,
+}
+
+impl MatchMode {
+    /// Parses the explicit mode names used by the CLI and Python bindings.
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "exact" => Ok(Self::Exact),
+            "prefix" => Ok(Self::Prefix),
+            _ => Err(Error::InvalidInput(
+                "match must be either 'exact' or 'prefix'".into(),
+            )),
+        }
+    }
 }
 
 /// Options controlling which GFF3 attributes are indexed.
@@ -125,7 +152,7 @@ impl NameIndexOptions {
     }
 }
 
-/// Statistics collected while building a GNI.
+/// Statistics collected while building a GAI.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct IndexStats {
     /// Number of non-comment GFF records read.
@@ -148,12 +175,26 @@ pub struct IndexStats {
     pub postings_bytes_before_compression: u64,
     /// Postings bytes after block compression.
     pub postings_bytes_after_compression: u64,
-    /// Span bytes represented by fixed-width triples.
+    /// Span bytes represented by fixed-width row metadata before structural encoding.
     pub span_bytes_fixed_width: u64,
     /// Span bytes after structural integer encoding.
     pub span_bytes_structural: u64,
     /// Span bytes after optional block compression.
     pub span_bytes_after_compression: u64,
+    /// Delta-varint start-coordinate bytes before block compression.
+    pub span_starts_bytes_before_compression: u64,
+    /// Delta-varint start-coordinate bytes after block compression.
+    pub span_starts_bytes_after_compression: u64,
+    /// Length-coordinate bytes before block compression.
+    pub span_lengths_bytes_before_compression: u64,
+    /// Length-coordinate bytes after block compression.
+    pub span_lengths_bytes_after_compression: u64,
+    /// Number of span blocks using delta-varint starts.
+    pub delta_start_blocks: u64,
+    /// Number of span blocks using varint lengths.
+    pub length_varint_blocks: u64,
+    /// Number of span blocks using FOR lengths.
+    pub length_for_blocks: u64,
     /// Final index bytes divided by the number of indexed terms.
     pub bytes_per_term: f64,
     /// Final index bytes divided by the number of unique postings.
@@ -166,7 +207,7 @@ pub struct IndexStats {
     pub peak_working_set_bytes: u64,
 }
 
-/// A major phase reported by a GNI build.
+/// A major phase reported by a GAI build.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BuildPhase {
     /// Streaming source parse and extraction.
@@ -220,7 +261,7 @@ pub struct BuildTimings {
 /// Callback invoked with monotonic build progress snapshots.
 pub type ProgressCallback = Arc<dyn Fn(BuildProgress) + Send + Sync + 'static>;
 
-/// Resource and observability controls for a GNI build.
+/// Resource and observability controls for a GAI build.
 #[derive(Clone)]
 pub struct BuildOptions {
     /// Approximate maximum scan/run working set before a sorted run is spilled.
@@ -312,7 +353,7 @@ impl GffRecord {
     }
 }
 
-/// A zero-based, half-open GNI span.
+/// A zero-based, half-open GAI span.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Span {
     /// Reference dictionary identifier.
@@ -404,20 +445,26 @@ pub struct IndexMetadata {
     pub span_directory_bytes: u64,
     /// Sum of uncompressed span block lengths.
     pub span_uncompressed_bytes: u64,
-    /// Compressed span-data size.
-    pub span_data_bytes: u64,
+    /// Starts-data section size.
+    pub starts_data_bytes: u64,
+    /// Lengths-data section size.
+    pub lengths_data_bytes: u64,
+    /// Sum of uncompressed starts block lengths.
+    pub starts_uncompressed_bytes: u64,
+    /// Sum of uncompressed lengths block lengths.
+    pub lengths_uncompressed_bytes: u64,
     /// Number of postings blocks using zstd.
     pub compressed_postings_blocks: u64,
-    /// Number of span blocks using zstd.
-    pub compressed_span_blocks: u64,
     /// Number of span blocks using delta-varint starts.
     pub delta_start_blocks: u64,
-    /// Number of span blocks using frame-of-reference starts.
-    pub for_start_blocks: u64,
     /// Number of span blocks using ordinary-varint lengths.
     pub varint_length_blocks: u64,
     /// Number of span blocks using frame-of-reference lengths.
     pub for_length_blocks: u64,
+    /// Number of starts blocks using zstd.
+    pub compressed_start_blocks: u64,
+    /// Number of lengths blocks using zstd.
+    pub compressed_length_blocks: u64,
 }
 
 /// Bytes decompressed while resolving one term. This is useful for measuring
@@ -433,9 +480,9 @@ pub struct LookupStats {
 /// Instrumentation for one indexed name query.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct QueryStats {
-    /// Number of exact GNI spans requested by the term posting.
+    /// Number of exact GAI spans requested by the term posting.
     pub requested_spans: u64,
-    /// Number of distinct GNI span blocks decoded while resolving the posting.
+    /// Number of distinct GAI span blocks decoded while resolving the posting.
     pub distinct_span_blocks_decoded: u64,
     /// Number of exact coordinate-index interval queries issued.
     pub exact_interval_queries: u64,
@@ -445,7 +492,8 @@ pub struct QueryStats {
     pub merged_chunks: u64,
     /// Number of unique source records parsed, keyed by BGZF virtual position.
     pub unique_candidate_records: u64,
-    /// Number of source records that matched the exact span and configured term.
+    /// Number of source records that matched a requested span and configured
+    /// value under the selected query mode.
     pub matching_records: u64,
     /// Uncompressed bytes returned while reading merged chunks.
     pub bytes_read: u64,
@@ -675,7 +723,7 @@ fn validate_coordinate_index_format(format: Format) -> Result<()> {
     Ok(())
 }
 
-/// Applies the GNI normalization policy: trim Unicode whitespace, then
+/// Applies the GAI normalization policy: trim Unicode whitespace, then
 /// lowercase ASCII letters unless `case_sensitive` is true.
 pub fn normalize_value(value: &str, case_sensitive: bool) -> String {
     let trimmed = value.trim_matches(char::is_whitespace);
@@ -788,6 +836,7 @@ fn feature_record_matches_term<R>(
     configured_attributes: &HashSet<String>,
     case_sensitive: bool,
     normalized_query: &str,
+    match_mode: MatchMode,
 ) -> Result<bool>
 where
     R: gff::feature::Record + ?Sized,
@@ -806,7 +855,12 @@ where
             })?;
             let value = std::str::from_utf8(value.as_ref())
                 .map_err(|_| Error::InvalidInput("GFF attribute value is not UTF-8".into()))?;
-            if normalize_value(value, case_sensitive) == normalized_query {
+            let normalized_value = normalize_value(value, case_sensitive);
+            let matches = match match_mode {
+                MatchMode::Exact => normalized_value == normalized_query,
+                MatchMode::Prefix => normalized_value.starts_with(normalized_query),
+            };
+            if matches {
                 return Ok(true);
             }
         }
@@ -883,7 +937,8 @@ enum SectionKind {
     PostingsDirectory = 3,
     PostingsData = 4,
     SpansDirectory = 5,
-    SpansData = 6,
+    StartsData = 6,
+    LengthsData = 7,
 }
 
 impl TryFrom<u32> for SectionKind {
@@ -896,7 +951,8 @@ impl TryFrom<u32> for SectionKind {
             3 => Ok(Self::PostingsDirectory),
             4 => Ok(Self::PostingsData),
             5 => Ok(Self::SpansDirectory),
-            6 => Ok(Self::SpansData),
+            6 => Ok(Self::StartsData),
+            7 => Ok(Self::LengthsData),
             _ => Err(Error::Corrupt(format!("unknown section kind {value}"))),
         }
     }
@@ -935,13 +991,18 @@ struct SpanDirectoryEntry {
     span_count: u32,
     reference_id: u32,
     first_start: u64,
-    compressed_offset: u64,
-    compressed_length: u32,
-    uncompressed_length: u32,
-    checksum: u32,
+    starts_compressed_offset: u64,
+    starts_compressed_length: u32,
+    starts_uncompressed_length: u32,
+    starts_checksum: u32,
+    lengths_compressed_offset: u64,
+    lengths_compressed_length: u32,
+    lengths_uncompressed_length: u32,
+    lengths_checksum: u32,
     start_encoding: u8,
     length_encoding: u8,
-    compression: u8,
+    starts_compression: u8,
+    lengths_compression: u8,
 }
 
 fn put_u32(buffer: &mut Vec<u8>, value: u32) {
@@ -1189,29 +1250,7 @@ impl PostingEncoder {
         if spans.is_empty() {
             return Ok(());
         }
-        let mut record = Vec::new();
-        write_varint(
-            &mut record,
-            u64::try_from(spans.len())
-                .map_err(|_| Error::InvalidInput("too many spans for a term".into()))?,
-        );
-        let mut previous = 0_u64;
-        for (index, span_id) in spans.iter().copied().enumerate() {
-            if index == 0 {
-                write_varint(&mut record, span_id);
-            } else {
-                let delta = span_id
-                    .checked_sub(previous)
-                    .ok_or_else(|| Error::InvalidInput("span IDs are not sorted".into()))?;
-                if delta == 0 {
-                    return Err(Error::InvalidInput(
-                        "posting spans are not deduplicated".into(),
-                    ));
-                }
-                write_varint(&mut record, delta);
-            }
-            previous = span_id;
-        }
+        let record = encode_delta_posting_record(spans)?;
         if !self.current.is_empty()
             && self
                 .current
@@ -1292,6 +1331,36 @@ impl PostingEncoder {
             term_count,
         ))
     }
+}
+
+fn encode_delta_posting_record(spans: &[u64]) -> Result<Vec<u8>> {
+    let count = u64::try_from(spans.len())
+        .map_err(|_| Error::InvalidInput("too many spans for a term".into()))?;
+    if count == 0 {
+        return Err(Error::InvalidInput(
+            "posting spans must not be empty".into(),
+        ));
+    }
+    let mut record = Vec::new();
+    write_varint(&mut record, count);
+    let mut previous = 0_u64;
+    for (index, span_id) in spans.iter().copied().enumerate() {
+        if index == 0 {
+            write_varint(&mut record, span_id);
+        } else {
+            let delta = span_id
+                .checked_sub(previous)
+                .ok_or_else(|| Error::InvalidInput("posting spans are not sorted".into()))?;
+            if delta == 0 {
+                return Err(Error::InvalidInput(
+                    "posting spans are not deduplicated".into(),
+                ));
+            }
+            write_varint(&mut record, delta);
+        }
+        previous = span_id;
+    }
+    Ok(record)
 }
 
 fn compress_blocks_parallel(blocks: &[Vec<u8>], thread_count: usize) -> Result<Vec<EncodedBlock>> {
@@ -1392,84 +1461,100 @@ fn encode_for_values_with_base(values: &[u64], base: u64) -> Result<(Vec<u8>, u6
     Ok((packed, base, bit_width))
 }
 
-fn encode_span_block(spans: &[SpanKey]) -> Result<(Vec<u8>, u8, u8, u64)> {
+/// Encodes reference-local, nondecreasing starts as canonical unsigned
+/// LEB128 deltas. The first absolute start is stored in the block directory,
+/// so this payload contains exactly one delta for every row after the first.
+/// Equal starts therefore encode as a zero delta, and a single-row block has
+/// an empty payload.
+fn encode_delta_start_payload(spans: &[SpanKey]) -> Result<Vec<u8>> {
     if spans.is_empty() {
         return Err(Error::InvalidInput(
             "cannot encode an empty span block".into(),
         ));
     }
-    let first_start = spans[0].start;
-    let mut start_deltas = Vec::with_capacity(spans.len().saturating_sub(1));
-    let mut previous_start = first_start;
+    let mut payload = Vec::new();
+    let mut previous = spans[0].start;
     for span in spans.iter().skip(1) {
         let delta = span
             .start
-            .checked_sub(previous_start)
-            .ok_or_else(|| Error::InvalidInput("span block is not sorted".into()))?;
-        start_deltas.push(delta);
-        previous_start = span.start;
+            .checked_sub(previous)
+            .ok_or_else(|| Error::InvalidInput("span starts are not nondecreasing".into()))?;
+        write_varint(&mut payload, delta);
+        previous = span.start;
     }
-    let lengths = spans.iter().map(|span| span.length).collect::<Vec<_>>();
-    let mut start_varints = Vec::new();
-    for delta in &start_deltas {
-        write_varint(&mut start_varints, *delta);
+    if payload.len() as u64 > MAX_BLOCK_BYTES {
+        return Err(Error::InvalidInput(
+            "delta start payload is too large".into(),
+        ));
     }
-    let mut length_varints = Vec::new();
-    for length in &lengths {
-        write_varint(&mut length_varints, *length);
-    }
-    // The first start is already stored in the fixed directory entry, so both
-    // candidate streams encode only the remaining rows.  Absolute start
-    // varints (encoding 0) are dominated by these sorted deltas: every delta
-    // is no larger than the corresponding absolute start, and the first row
-    // is omitted from both representations.
-    let relative_starts = spans
-        .iter()
-        .skip(1)
-        .map(|span| span.start - first_start)
-        .collect::<Vec<_>>();
-    let (start_for, _, start_width) = encode_for_values_with_base(&relative_starts, 0)?;
-    let (length_for, length_base, length_width) = encode_for_values(&lengths)?;
-    let (start_encoding, start_stream, start_bit_width) =
-        if start_width <= 63 && start_for.len() < start_varints.len() {
-            (2_u8, start_for, start_width)
-        } else {
-            (1_u8, start_varints, 0_u8)
-        };
-    let (length_encoding, length_stream, length_base, length_bit_width) =
-        if length_width <= 63 && length_for.len() < length_varints.len() {
-            (2_u8, length_for, length_base, length_width)
-        } else {
-            (0_u8, length_varints, 0_u64, 0_u8)
-        };
-    let mut payload = Vec::new();
-    put_u32(
-        &mut payload,
-        u32::try_from(start_stream.len())
-            .map_err(|_| Error::InvalidInput("span start stream exceeds 4 GiB".into()))?,
-    );
-    put_u32(
-        &mut payload,
-        u32::try_from(length_stream.len())
-            .map_err(|_| Error::InvalidInput("span length stream exceeds 4 GiB".into()))?,
-    );
-    put_u64(&mut payload, length_base);
-    payload.push(start_encoding);
-    payload.push(length_encoding);
-    payload.push(start_bit_width);
-    payload.push(length_bit_width);
-    payload.extend_from_slice(&start_stream);
-    payload.extend_from_slice(&length_stream);
-    Ok((payload, start_encoding, length_encoding, first_start))
+    Ok(payload)
 }
 
-#[allow(clippy::type_complexity)]
-#[cfg(test)]
-fn encode_span_blocks(
-    spans: &[SpanKey],
-    spans_per_block: usize,
-) -> Result<(Vec<SpanDirectoryEntry>, Vec<u8>, u64, u64, u64)> {
-    encode_span_blocks_with_threads(spans, spans_per_block, 1)
+fn canonical_varint_length(value: u64) -> usize {
+    if value == 0 {
+        1
+    } else {
+        (64 - value.leading_zeros()).div_ceil(7) as usize
+    }
+}
+
+fn read_canonical_varint(bytes: &[u8], offset: &mut usize, context: &str) -> Result<u64> {
+    let start = *offset;
+    let value = read_varint(bytes, offset, context)?;
+    if offset.saturating_sub(start) != canonical_varint_length(value) {
+        return Err(Error::Corrupt(format!("noncanonical varint in {context}")));
+    }
+    Ok(value)
+}
+
+fn encode_length_payload(spans: &[SpanKey]) -> Result<(Vec<u8>, u8)> {
+    let lengths = spans.iter().map(|span| span.length).collect::<Vec<_>>();
+    let mut varints = Vec::new();
+    for length in &lengths {
+        write_varint(&mut varints, *length);
+    }
+    let (for_stream, base, bit_width) = encode_for_values(&lengths)?;
+    let (encoding, stream, base, bit_width) = if bit_width <= 63 && for_stream.len() < varints.len()
+    {
+        (2_u8, for_stream, base, bit_width)
+    } else {
+        (0_u8, varints, 0_u64, 0_u8)
+    };
+    let mut payload = Vec::with_capacity(
+        LENGTH_PAYLOAD_HEADER_SIZE
+            .checked_add(stream.len())
+            .ok_or(Error::InvalidCoordinate)?,
+    );
+    put_u32(
+        &mut payload,
+        u32::try_from(spans.len()).map_err(|_| Error::InvalidInput("too many span rows".into()))?,
+    );
+    payload.push(encoding);
+    payload.push(bit_width);
+    payload.extend_from_slice(&[0; 2]);
+    put_u64(&mut payload, base);
+    put_u32(
+        &mut payload,
+        u32::try_from(stream.len())
+            .map_err(|_| Error::InvalidInput("length stream is too large".into()))?,
+    );
+    payload.extend_from_slice(&stream);
+    if payload.len() as u64 > MAX_BLOCK_BYTES {
+        return Err(Error::InvalidInput("length payload is too large".into()));
+    }
+    Ok((payload, encoding))
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SpanEncodingStats {
+    fixed_width_bytes: u64,
+    starts_structural_bytes: u64,
+    lengths_structural_bytes: u64,
+    starts_compressed_bytes: u64,
+    lengths_compressed_bytes: u64,
+    delta_start_blocks: u64,
+    length_varint_blocks: u64,
+    length_for_blocks: u64,
 }
 
 #[allow(clippy::type_complexity)]
@@ -1477,7 +1562,7 @@ fn encode_span_blocks_with_threads(
     spans: &[SpanKey],
     spans_per_block: usize,
     compression_threads: usize,
-) -> Result<(Vec<SpanDirectoryEntry>, Vec<u8>, u64, u64, u64)> {
+) -> Result<(Vec<SpanDirectoryEntry>, Vec<u8>, Vec<u8>, SpanEncodingStats)> {
     use rayon::prelude::*;
 
     if spans_per_block == 0 {
@@ -1512,41 +1597,46 @@ fn encode_span_blocks_with_threads(
             .par_iter()
             .map(|(block_start, block_end)| {
                 let block = &spans[*block_start..*block_end];
-                let (payload, start_encoding, length_encoding, first_start) =
-                    encode_span_block(block)?;
-                let encoded = compress_block(&payload)?;
+                let starts_payload = encode_delta_start_payload(block)?;
+                let (lengths_payload, length_encoding) = encode_length_payload(block)?;
+                let starts_encoded = compress_block(&starts_payload)?;
+                let lengths_encoded = compress_block(&lengths_payload)?;
                 Ok::<_, Error>((
                     block.len(),
                     block[0].reference_id,
-                    first_start,
-                    start_encoding,
+                    block[0].start,
                     length_encoding,
-                    payload.len() as u64,
-                    encoded,
+                    starts_payload.len() as u64,
+                    lengths_payload.len() as u64,
+                    starts_encoded,
+                    lengths_encoded,
                 ))
             })
             .collect::<Result<Vec<_>>>()
     })?;
 
     let mut directory = Vec::with_capacity(encoded_blocks.len());
-    let mut data = Vec::new();
-    let mut fixed_width_bytes = 0_u64;
-    let mut structural_bytes = 0_u64;
-    let mut compressed_bytes = 0_u64;
+    let mut starts_data = Vec::new();
+    let mut lengths_data = Vec::new();
+    let mut stats = SpanEncodingStats::default();
     let mut first_span_id = 0_u64;
     for (
         span_count,
         reference_id,
         first_start,
-        start_encoding,
         length_encoding,
-        payload_length,
-        encoded,
+        starts_payload_length,
+        lengths_payload_length,
+        starts_encoded,
+        lengths_encoded,
     ) in encoded_blocks
     {
-        let compressed_offset = u64::try_from(data.len())
-            .map_err(|_| Error::InvalidInput("span data exceeds 4 GiB".into()))?;
-        data.extend_from_slice(&encoded.compressed);
+        let starts_compressed_offset = u64::try_from(starts_data.len())
+            .map_err(|_| Error::InvalidInput("starts data exceeds 4 GiB".into()))?;
+        starts_data.extend_from_slice(&starts_encoded.compressed);
+        let lengths_compressed_offset = u64::try_from(lengths_data.len())
+            .map_err(|_| Error::InvalidInput("lengths data exceeds 4 GiB".into()))?;
+        lengths_data.extend_from_slice(&lengths_encoded.compressed);
         let span_count = u32::try_from(span_count)
             .map_err(|_| Error::InvalidInput("span block has too many rows".into()))?;
         directory.push(SpanDirectoryEntry {
@@ -1554,35 +1644,53 @@ fn encode_span_blocks_with_threads(
             span_count,
             reference_id,
             first_start,
-            compressed_offset,
-            compressed_length: u32::try_from(encoded.compressed.len())
-                .map_err(|_| Error::InvalidInput("compressed span block exceeds 4 GiB".into()))?,
-            uncompressed_length: encoded.uncompressed_length,
-            checksum: encoded.checksum,
-            start_encoding,
+            starts_compressed_offset,
+            starts_compressed_length: u32::try_from(starts_encoded.compressed.len())
+                .map_err(|_| Error::InvalidInput("compressed starts block exceeds 4 GiB".into()))?,
+            starts_uncompressed_length: starts_encoded.uncompressed_length,
+            starts_checksum: starts_encoded.checksum,
+            lengths_compressed_offset,
+            lengths_compressed_length: u32::try_from(lengths_encoded.compressed.len()).map_err(
+                |_| Error::InvalidInput("compressed lengths block exceeds 4 GiB".into()),
+            )?,
+            lengths_uncompressed_length: lengths_encoded.uncompressed_length,
+            lengths_checksum: lengths_encoded.checksum,
+            start_encoding: START_ENCODING_DELTA,
             length_encoding,
-            compression: encoded.compression,
+            starts_compression: starts_encoded.compression,
+            lengths_compression: lengths_encoded.compression,
         });
-        fixed_width_bytes = fixed_width_bytes
+        stats.fixed_width_bytes = stats
+            .fixed_width_bytes
             .checked_add(u64::from(span_count).saturating_mul(20))
             .ok_or(Error::InvalidCoordinate)?;
-        structural_bytes = structural_bytes
-            .checked_add(payload_length)
+        stats.starts_structural_bytes = stats
+            .starts_structural_bytes
+            .checked_add(starts_payload_length)
             .ok_or(Error::InvalidCoordinate)?;
-        compressed_bytes = compressed_bytes
-            .checked_add(encoded.compressed.len() as u64)
+        stats.lengths_structural_bytes = stats
+            .lengths_structural_bytes
+            .checked_add(lengths_payload_length)
             .ok_or(Error::InvalidCoordinate)?;
+        stats.starts_compressed_bytes = stats
+            .starts_compressed_bytes
+            .checked_add(starts_encoded.compressed.len() as u64)
+            .ok_or(Error::InvalidCoordinate)?;
+        stats.lengths_compressed_bytes = stats
+            .lengths_compressed_bytes
+            .checked_add(lengths_encoded.compressed.len() as u64)
+            .ok_or(Error::InvalidCoordinate)?;
+        stats.delta_start_blocks += 1;
+        if length_encoding == 0 {
+            stats.length_varint_blocks += 1;
+        } else if length_encoding == 2 {
+            stats.length_for_blocks += 1;
+        }
         first_span_id = first_span_id
             .checked_add(u64::from(span_count))
             .ok_or(Error::InvalidCoordinate)?;
     }
-    Ok((
-        directory,
-        data,
-        fixed_width_bytes,
-        structural_bytes,
-        compressed_bytes,
-    ))
+    Ok((directory, starts_data, lengths_data, stats))
 }
 
 fn encode_span_directory(entries: &[SpanDirectoryEntry]) -> Result<Vec<u8>> {
@@ -1597,14 +1705,18 @@ fn encode_span_directory(entries: &[SpanDirectoryEntry]) -> Result<Vec<u8>> {
         put_u32(&mut bytes, entry.span_count);
         put_u32(&mut bytes, entry.reference_id);
         put_u64(&mut bytes, entry.first_start);
-        put_u64(&mut bytes, entry.compressed_offset);
-        put_u32(&mut bytes, entry.compressed_length);
-        put_u32(&mut bytes, entry.uncompressed_length);
-        put_u32(&mut bytes, entry.checksum);
+        put_u64(&mut bytes, entry.starts_compressed_offset);
+        put_u32(&mut bytes, entry.starts_compressed_length);
+        put_u32(&mut bytes, entry.starts_uncompressed_length);
+        put_u32(&mut bytes, entry.starts_checksum);
+        put_u64(&mut bytes, entry.lengths_compressed_offset);
+        put_u32(&mut bytes, entry.lengths_compressed_length);
+        put_u32(&mut bytes, entry.lengths_uncompressed_length);
+        put_u32(&mut bytes, entry.lengths_checksum);
         bytes.push(entry.start_encoding);
         bytes.push(entry.length_encoding);
-        bytes.push(entry.compression);
-        bytes.push(0);
+        bytes.push(entry.starts_compression);
+        bytes.push(entry.lengths_compression);
         put_u32(&mut bytes, 0);
     }
     Ok(bytes)
@@ -1677,12 +1789,14 @@ fn serialize_index(
     postings_directory: &[PostingDirectoryEntry],
     postings_data: Vec<u8>,
     spans_directory: Vec<u8>,
-    spans_data: Vec<u8>,
+    starts_data: Vec<u8>,
+    lengths_data: Vec<u8>,
     spans_per_block: usize,
 ) -> Result<Vec<u8>> {
     let attributes_section = encode_attributes(attributes)?;
     let postings_data_length = postings_data.len() as u64;
-    let spans_data_length = spans_data.len() as u64;
+    let starts_data_length = starts_data.len() as u64;
+    let lengths_data_length = lengths_data.len() as u64;
     let sections = [
         (
             SectionKind::Attributes,
@@ -1705,7 +1819,8 @@ fn serialize_index(
             spans_directory,
             span_block_count,
         ),
-        (SectionKind::SpansData, spans_data, spans_data_length),
+        (SectionKind::StartsData, starts_data, starts_data_length),
+        (SectionKind::LengthsData, lengths_data, lengths_data_length),
     ];
     let section_directory_offset = HEADER_SIZE as u64;
     let section_directory_length = u64::try_from(
@@ -1720,10 +1835,10 @@ fn serialize_index(
     let section_count = sections.len();
     for (kind, section, item_count) in &sections {
         let offset = u64::try_from(output.len())
-            .map_err(|_| Error::InvalidInput("GNI exceeds 4 GiB".into()))?;
+            .map_err(|_| Error::InvalidInput("GAI exceeds 4 GiB".into()))?;
         if section.len() as u64 > MAX_SECTION_BYTES {
             return Err(Error::InvalidInput(
-                "GNI section exceeds safety limit".into(),
+                "GAI section exceeds safety limit".into(),
             ));
         }
         let section_checksum = checksum(section);
@@ -1777,9 +1892,8 @@ fn serialize_index(
     set_u64(&mut output, 176, section_directory_offset);
     set_u64(&mut output, 184, section_directory_length);
     let output_len =
-        u64::try_from(output.len()).map_err(|_| Error::InvalidInput("GNI exceeds 4 GiB".into()))?;
+        u64::try_from(output.len()).map_err(|_| Error::InvalidInput("GAI exceeds 4 GiB".into()))?;
     set_u64(&mut output, 192, output_len);
-    // Bytes 204..256 are reserved and remain zero for forward compatibility.
     Ok(output)
 }
 
@@ -1973,7 +2087,7 @@ impl SpanRunReader {
         let mut magic = [0_u8; 8];
         reader.read_exact(&mut magic)?;
         if magic != RUN_MAGIC {
-            return Err(Error::InvalidInput("invalid GNI spill run magic".into()));
+            return Err(Error::InvalidInput("invalid GAI spill run magic".into()));
         }
         let remaining = read_run_u64(&mut reader, "spill span count")?;
         Ok(Self { reader, remaining })
@@ -2004,7 +2118,7 @@ impl TermRunReader {
         let mut magic = [0_u8; 8];
         reader.read_exact(&mut magic)?;
         if magic != RUN_MAGIC {
-            return Err(Error::InvalidInput("invalid GNI spill run magic".into()));
+            return Err(Error::InvalidInput("invalid GAI spill run magic".into()));
         }
         let span_count = read_run_u64(&mut reader, "spill span count")?;
         let span_bytes = span_count
@@ -2251,7 +2365,7 @@ where
     }
 }
 
-/// Builds a deterministic GNI beside a BGZF or plain GFF3 source.
+/// Builds a deterministic GAI beside a BGZF or plain GFF3 source.
 pub fn build_name_index(
     gff_path: impl AsRef<Path>,
     coordinate_index_path: impl AsRef<Path>,
@@ -2267,7 +2381,7 @@ pub fn build_name_index(
     )
 }
 
-/// Builds a deterministic GNI with explicit resource and progress controls.
+/// Builds a deterministic GAI with explicit resource and progress controls.
 pub fn build_name_index_with_options(
     gff_path: impl AsRef<Path>,
     coordinate_index_path: impl AsRef<Path>,
@@ -2285,7 +2399,7 @@ pub fn build_name_index_with_options(
     )
 }
 
-/// Builds a GNI with an explicit reference-specific span-block row target.
+/// Builds a GAI with an explicit reference-specific span-block row target.
 /// The default [`build_name_index`] value is 4,096; this variant is provided
 /// for reproducible compression experiments and deployment tuning.
 pub fn build_name_index_with_span_block_size(
@@ -2305,7 +2419,7 @@ pub fn build_name_index_with_span_block_size(
     )
 }
 
-/// Builds a GNI with explicit span-block and resource controls.
+/// Builds a GAI with explicit span-block and resource controls.
 pub fn build_name_index_with_options_and_span_block_size(
     gff_path: impl AsRef<Path>,
     coordinate_index_path: impl AsRef<Path>,
@@ -2362,7 +2476,7 @@ pub fn build_name_index_with_options_and_span_block_size(
         &destination
             .file_name()
             .map(|name| name.to_string_lossy())
-            .unwrap_or_else(|| "gni".into()),
+            .unwrap_or_else(|| "gai".into()),
     );
     let bytes_read = Arc::new(AtomicU64::new(0));
     let mut records_processed = 0_u64;
@@ -2458,12 +2572,13 @@ pub fn build_name_index_with_options_and_span_block_size(
     );
 
     let postings_started = Instant::now();
+    let posting_encoding = encode_postings_from_runs(
+        collector.run_paths(),
+        &coordinate_spans,
+        build_options.compression_threads,
+    )?;
     let (terms, posting_directory, postings_data, postings_before, unique_postings, term_count) =
-        encode_postings_from_runs(
-            collector.run_paths(),
-            &coordinate_spans,
-            build_options.compression_threads,
-        )?;
+        posting_encoding;
     let postings_duration = postings_started.elapsed();
     report_progress(
         build_options,
@@ -2474,7 +2589,7 @@ pub fn build_name_index_with_options_and_span_block_size(
     );
 
     let spans_started = Instant::now();
-    let (span_directory, spans_data, spans_fixed, spans_structural, spans_compressed) =
+    let (span_directory, starts_data, lengths_data, span_encoding_stats) =
         encode_span_blocks_with_threads(
             &coordinate_spans,
             spans_per_block,
@@ -2508,7 +2623,8 @@ pub fn build_name_index_with_options_and_span_block_size(
         &posting_directory,
         postings_data,
         span_directory_bytes,
-        spans_data,
+        starts_data,
+        lengths_data,
         spans_per_block,
     )?;
     let index_bytes = serialized.len() as u64;
@@ -2552,9 +2668,22 @@ pub fn build_name_index_with_options_and_span_block_size(
         index_bytes,
         postings_bytes_before_compression: postings_before,
         postings_bytes_after_compression: postings_after,
-        span_bytes_fixed_width: spans_fixed,
-        span_bytes_structural: spans_structural,
-        span_bytes_after_compression: spans_compressed,
+        span_bytes_fixed_width: span_encoding_stats.fixed_width_bytes,
+        span_bytes_structural: span_encoding_stats
+            .starts_structural_bytes
+            .checked_add(span_encoding_stats.lengths_structural_bytes)
+            .ok_or(Error::InvalidCoordinate)?,
+        span_bytes_after_compression: span_encoding_stats
+            .starts_compressed_bytes
+            .checked_add(span_encoding_stats.lengths_compressed_bytes)
+            .ok_or(Error::InvalidCoordinate)?,
+        span_starts_bytes_before_compression: span_encoding_stats.starts_structural_bytes,
+        span_starts_bytes_after_compression: span_encoding_stats.starts_compressed_bytes,
+        span_lengths_bytes_before_compression: span_encoding_stats.lengths_structural_bytes,
+        span_lengths_bytes_after_compression: span_encoding_stats.lengths_compressed_bytes,
+        delta_start_blocks: span_encoding_stats.delta_start_blocks,
+        length_varint_blocks: span_encoding_stats.length_varint_blocks,
+        length_for_blocks: span_encoding_stats.length_for_blocks,
         bytes_per_term: index_bytes as f64 / (term_count.max(1) as f64),
         bytes_per_posting: index_bytes as f64 / (unique_postings.max(1) as f64),
         bytes_per_unique_span: index_bytes as f64 / (coordinate_spans.len().max(1) as f64),
@@ -2619,7 +2748,7 @@ impl AsRef<[u8]> for IndexStorage {
     }
 }
 
-/// A bounds-checked GNI reader. It only decompresses the posting and span
+/// A bounds-checked GAI reader. It only decompresses the posting and span
 /// blocks needed by an individual lookup. [`Self::open_mmap`] keeps the FST
 /// and fixed directories in an OS memory map instead of copying the file.
 pub struct NameIndexReader {
@@ -2631,13 +2760,13 @@ pub struct NameIndexReader {
 }
 
 impl NameIndexReader {
-    /// Opens and validates a GNI file without opening its source files.
+    /// Opens and validates a GAI file without opening its source files.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let bytes = fs::read(path)?;
         Self::from_bytes(bytes)
     }
 
-    /// Opens and validates a GNI using a read-only memory map.
+    /// Opens and validates a GAI using a read-only memory map.
     pub fn open_mmap(path: impl AsRef<Path>) -> Result<Self> {
         let file = File::open(path)?;
         // SAFETY: the file descriptor remains valid while the map is created;
@@ -2646,8 +2775,8 @@ impl NameIndexReader {
         Self::from_storage(IndexStorage::Mapped(bytes))
     }
 
-    /// Parses a GNI byte stream.  This is useful for corruption tests and for
-    /// callers that memory-map the file themselves before handing it to GNI.
+    /// Parses a GAI byte stream.  This is useful for corruption tests and for
+    /// callers that memory-map the file themselves before handing it to GAI.
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
         Self::from_storage(IndexStorage::Owned(bytes))
     }
@@ -2655,27 +2784,27 @@ impl NameIndexReader {
     fn from_storage(storage: IndexStorage) -> Result<Self> {
         let bytes = storage.as_ref();
         if bytes.len() < HEADER_SIZE {
-            return Err(Error::Corrupt("truncated GNI header".into()));
+            return Err(Error::Corrupt("truncated GAI header".into()));
         }
         if bytes[..4] != MAGIC {
-            return Err(Error::Corrupt("invalid GNI magic".into()));
+            return Err(Error::Corrupt("invalid GAI magic".into()));
         }
         let mut offset = 4;
         let major_version = read_u16(bytes, &mut offset, "major version")?;
         let minor_version = read_u16(bytes, &mut offset, "minor version")?;
         if major_version != MAJOR_VERSION {
             return Err(Error::Corrupt(format!(
-                "unsupported GNI major version {major_version}"
+                "unsupported GAI major version {major_version}"
             )));
         }
         if minor_version > MINOR_VERSION {
             return Err(Error::Corrupt(format!(
-                "unsupported GNI minor version {minor_version}"
+                "unsupported GAI minor version {minor_version}"
             )));
         }
         let flags = read_u32(bytes, &mut offset, "flags")?;
         if flags & !1 != 0 {
-            return Err(Error::Corrupt("unknown GNI flags".into()));
+            return Err(Error::Corrupt("unknown GAI flags".into()));
         }
         let byte_order = read_u8(bytes, &mut offset, "byte order")?;
         let coordinate_convention = read_u8(bytes, &mut offset, "coordinate convention")?;
@@ -2685,7 +2814,7 @@ impl NameIndexReader {
             || coordinate_convention != COORDINATE_ZERO_BASED_HALF_OPEN
             || reserved != 0
         {
-            return Err(Error::Corrupt("unsupported GNI header conventions".into()));
+            return Err(Error::Corrupt("unsupported GAI header conventions".into()));
         }
         if normalization > NORMALIZATION_CASE_SENSITIVE {
             return Err(Error::Corrupt("unknown normalization policy".into()));
@@ -2698,10 +2827,10 @@ impl NameIndexReader {
             || directory_entry_size != DIRECTORY_ENTRY_SIZE
             || reserved != 0
         {
-            return Err(Error::Corrupt("unsupported GNI header layout".into()));
+            return Err(Error::Corrupt("unsupported GAI header layout".into()));
         }
-        if !(1..=32).contains(&section_count) {
-            return Err(Error::Corrupt("invalid section count".into()));
+        if section_count != 7 {
+            return Err(Error::Corrupt("unsupported GAI section count".into()));
         }
         let term_count = read_u64(bytes, &mut offset, "term count")?;
         let unique_span_count = read_u64(bytes, &mut offset, "span count")?;
@@ -2717,7 +2846,7 @@ impl NameIndexReader {
             || (term_count > 0 && postings_block_count == 0)
             || (unique_span_count > 0 && span_block_count == 0)
         {
-            return Err(Error::Corrupt("inconsistent GNI counts".into()));
+            return Err(Error::Corrupt("inconsistent GAI counts".into()));
         }
         let gff_fingerprint = read_array::<32>(bytes, &mut offset, "GFF fingerprint")?;
         let coordinate_index_fingerprint =
@@ -2740,7 +2869,7 @@ impl NameIndexReader {
             return Err(Error::Corrupt("nonzero reserved header bytes".into()));
         }
         if file_size != bytes.len() as u64 {
-            return Err(Error::Corrupt("GNI file size mismatch".into()));
+            return Err(Error::Corrupt("GAI file size mismatch".into()));
         }
         let directory_end = section_directory_offset
             .checked_add(section_directory_length)
@@ -2809,7 +2938,7 @@ impl NameIndexReader {
             .windows(2)
             .any(|ranges| ranges[0].1 > ranges[1].0)
         {
-            return Err(Error::Corrupt("overlapping GNI sections".into()));
+            return Err(Error::Corrupt("overlapping GAI sections".into()));
         }
         let required = [
             SectionKind::Attributes,
@@ -2817,26 +2946,32 @@ impl NameIndexReader {
             SectionKind::PostingsDirectory,
             SectionKind::PostingsData,
             SectionKind::SpansDirectory,
-            SectionKind::SpansData,
+            SectionKind::StartsData,
+            SectionKind::LengthsData,
         ];
         if required.iter().any(|kind| !sections.contains_key(kind)) {
-            return Err(Error::Corrupt("missing required GNI section".into()));
+            return Err(Error::Corrupt("missing required GAI section".into()));
         }
         let postings_data_length = sections
             .get(&SectionKind::PostingsData)
             .map(|section| section.length)
             .ok_or_else(|| Error::Corrupt("missing postings data section".into()))?;
-        let spans_data_length = sections
-            .get(&SectionKind::SpansData)
+        let starts_data_length = sections
+            .get(&SectionKind::StartsData)
             .map(|section| section.length)
-            .ok_or_else(|| Error::Corrupt("missing spans data section".into()))?;
+            .ok_or_else(|| Error::Corrupt("missing starts data section".into()))?;
+        let lengths_data_length = sections
+            .get(&SectionKind::LengthsData)
+            .map(|section| section.length)
+            .ok_or_else(|| Error::Corrupt("missing lengths data section".into()))?;
         let expected_items = [
             (SectionKind::Attributes, attribute_count as u64),
             (SectionKind::Terms, term_count),
             (SectionKind::PostingsDirectory, postings_block_count),
             (SectionKind::PostingsData, postings_data_length),
             (SectionKind::SpansDirectory, span_block_count),
-            (SectionKind::SpansData, spans_data_length),
+            (SectionKind::StartsData, starts_data_length),
+            (SectionKind::LengthsData, lengths_data_length),
         ];
         for (kind, expected) in expected_items {
             if sections
@@ -2875,7 +3010,8 @@ impl NameIndexReader {
         )?;
         let span_directory = decode_span_directory(
             section_bytes(SectionKind::SpansDirectory)?,
-            section_bytes(SectionKind::SpansData)?.len() as u64,
+            section_bytes(SectionKind::StartsData)?.len() as u64,
+            section_bytes(SectionKind::LengthsData)?.len() as u64,
             span_block_count,
             unique_span_count,
             spans_per_block,
@@ -2889,12 +3025,29 @@ impl NameIndexReader {
                 total.checked_add(u64::from(entry.uncompressed_length))
             })
             .ok_or_else(|| Error::Corrupt("postings uncompressed size overflow".into()))?;
-        let span_uncompressed_bytes = span_directory
+        let starts_uncompressed_bytes = span_directory
             .iter()
             .try_fold(0_u64, |total, entry| {
-                total.checked_add(u64::from(entry.uncompressed_length))
+                total.checked_add(u64::from(entry.starts_uncompressed_length))
             })
+            .ok_or_else(|| Error::Corrupt("starts uncompressed size overflow".into()))?;
+        let lengths_uncompressed_bytes = span_directory
+            .iter()
+            .try_fold(0_u64, |total, entry| {
+                total.checked_add(u64::from(entry.lengths_uncompressed_length))
+            })
+            .ok_or_else(|| Error::Corrupt("lengths uncompressed size overflow".into()))?;
+        let span_uncompressed_bytes = starts_uncompressed_bytes
+            .checked_add(lengths_uncompressed_bytes)
             .ok_or_else(|| Error::Corrupt("span uncompressed size overflow".into()))?;
+        let starts_compressed_blocks = span_directory
+            .iter()
+            .filter(|entry| entry.starts_compression == 1)
+            .count() as u64;
+        let lengths_compressed_blocks = span_directory
+            .iter()
+            .filter(|entry| entry.lengths_compression == 1)
+            .count() as u64;
         let file_size = bytes.len() as u64;
         Ok(Self {
             bytes: storage,
@@ -2921,23 +3074,15 @@ impl NameIndexReader {
                 postings_data_bytes: section_length(SectionKind::PostingsData),
                 span_directory_bytes: section_length(SectionKind::SpansDirectory),
                 span_uncompressed_bytes,
-                span_data_bytes: section_length(SectionKind::SpansData),
+                starts_data_bytes: section_length(SectionKind::StartsData),
+                lengths_data_bytes: section_length(SectionKind::LengthsData),
+                starts_uncompressed_bytes,
+                lengths_uncompressed_bytes,
                 compressed_postings_blocks: posting_directory
                     .iter()
                     .filter(|entry| entry.compression == 1)
                     .count() as u64,
-                compressed_span_blocks: span_directory
-                    .iter()
-                    .filter(|entry| entry.compression == 1)
-                    .count() as u64,
-                delta_start_blocks: span_directory
-                    .iter()
-                    .filter(|entry| entry.start_encoding == 1)
-                    .count() as u64,
-                for_start_blocks: span_directory
-                    .iter()
-                    .filter(|entry| entry.start_encoding == 2)
-                    .count() as u64,
+                delta_start_blocks: span_directory.len() as u64,
                 varint_length_blocks: span_directory
                     .iter()
                     .filter(|entry| entry.length_encoding == 0)
@@ -2946,6 +3091,8 @@ impl NameIndexReader {
                     .iter()
                     .filter(|entry| entry.length_encoding == 2)
                     .count() as u64,
+                compressed_start_blocks: starts_compressed_blocks,
+                compressed_length_blocks: lengths_compressed_blocks,
             },
             sections,
             posting_directory,
@@ -2965,58 +3112,39 @@ impl NameIndexReader {
 
     /// Looks up a normalized term and returns its exact spans.
     pub fn lookup_spans(&self, term: &str) -> Result<Vec<Span>> {
-        let normalized = normalize_value(term, self.metadata.case_sensitive);
-        if normalized.is_empty() {
-            return Ok(Vec::new());
-        }
-        let terms_section = self.section(SectionKind::Terms)?;
-        let term_map = fst::Map::new(terms_section)
-            .map_err(|error| Error::Corrupt(format!("invalid term FST: {error}")))?;
-        let Some(locator) = term_map.get(normalized) else {
-            return Ok(Vec::new());
-        };
-        let block_id = usize::try_from(locator >> 32)
-            .map_err(|_| Error::Corrupt("posting block ID overflows usize".into()))?;
-        let record_offset = usize::try_from(locator & u64::from(u32::MAX))
-            .map_err(|_| Error::Corrupt("posting offset overflows usize".into()))?;
-        let posting_bytes = self.decode_posting_block(block_id)?;
-        let span_ids = decode_posting_record(
-            &posting_bytes,
-            record_offset,
-            self.metadata.unique_span_count,
-        )?;
+        self.lookup_spans_with_mode(term, MatchMode::Exact)
+    }
+
+    /// Looks up a normalized term using the requested match mode and returns
+    /// its coordinate-ordered spans. Prefix matching streams matching keys
+    /// directly from the immutable FST and decodes each referenced postings
+    /// block at most once.
+    pub fn lookup_spans_with_mode(&self, term: &str, mode: MatchMode) -> Result<Vec<Span>> {
+        let (span_ids, _) = self.lookup_span_ids_with_mode_and_stats(term, mode)?;
         self.resolve_span_ids(&span_ids)
     }
 
-    /// Looks up spans and reports the independently decoded bytes used by the
-    /// lookup. Each span block is counted once even when several span IDs in
-    /// the posting share it.
+    /// Looks up spans and reports the independently decoded bytes used by an
+    /// exact query.
     pub fn lookup_spans_with_stats(&self, term: &str) -> Result<(Vec<Span>, LookupStats)> {
-        let normalized = normalize_value(term, self.metadata.case_sensitive);
-        if normalized.is_empty() {
-            return Ok((Vec::new(), LookupStats::default()));
-        }
-        let terms_section = self.section(SectionKind::Terms)?;
-        let term_map = fst::Map::new(terms_section)
-            .map_err(|error| Error::Corrupt(format!("invalid term FST: {error}")))?;
-        let Some(locator) = term_map.get(normalized) else {
-            return Ok((Vec::new(), LookupStats::default()));
-        };
-        let block_id = usize::try_from(locator >> 32)
-            .map_err(|_| Error::Corrupt("posting block ID overflows usize".into()))?;
-        let record_offset = usize::try_from(locator & u64::from(u32::MAX))
-            .map_err(|_| Error::Corrupt("posting offset overflows usize".into()))?;
-        let posting_bytes = self.decode_posting_block(block_id)?;
-        let span_ids = decode_posting_record(
-            &posting_bytes,
-            record_offset,
-            self.metadata.unique_span_count,
-        )?;
+        self.lookup_spans_with_mode_and_stats(term, MatchMode::Exact)
+    }
+
+    /// Looks up spans with an explicit match mode and reports the independently
+    /// decoded bytes used by the lookup. Each postings and span block is
+    /// counted once even when several matching terms or span IDs share it.
+    pub fn lookup_spans_with_mode_and_stats(
+        &self,
+        term: &str,
+        mode: MatchMode,
+    ) -> Result<(Vec<Span>, LookupStats)> {
+        let (span_ids, postings_bytes_decompressed) =
+            self.lookup_span_ids_with_mode_and_stats(term, mode)?;
         let (spans, _, span_bytes_decompressed) = self.resolve_span_ids_with_stats(&span_ids)?;
         Ok((
             spans,
             LookupStats {
-                postings_bytes_decompressed: posting_bytes.len() as u64,
+                postings_bytes_decompressed,
                 span_bytes_decompressed,
             },
         ))
@@ -3024,26 +3152,68 @@ impl NameIndexReader {
 
     /// Returns the sorted span IDs for an exact normalized term.
     pub fn lookup_span_ids(&self, term: &str) -> Result<Vec<u64>> {
+        self.lookup_span_ids_with_mode(term, MatchMode::Exact)
+    }
+
+    /// Returns the sorted, deduplicated span IDs for a normalized term and
+    /// explicit match mode.
+    pub fn lookup_span_ids_with_mode(&self, term: &str, mode: MatchMode) -> Result<Vec<u64>> {
+        self.lookup_span_ids_with_mode_and_stats(term, mode)
+            .map(|(span_ids, _)| span_ids)
+    }
+
+    fn lookup_span_ids_with_mode_and_stats(
+        &self,
+        term: &str,
+        mode: MatchMode,
+    ) -> Result<(Vec<u64>, u64)> {
         let normalized = normalize_value(term, self.metadata.case_sensitive);
         if normalized.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         }
         let terms_section = self.section(SectionKind::Terms)?;
         let term_map = fst::Map::new(terms_section)
             .map_err(|error| Error::Corrupt(format!("invalid term FST: {error}")))?;
-        let Some(locator) = term_map.get(normalized) else {
-            return Ok(Vec::new());
+        let locators = match mode {
+            MatchMode::Exact => term_map.get(normalized).into_iter().collect(),
+            MatchMode::Prefix => fst::IntoStreamer::into_stream(
+                term_map.search(fst::automaton::Str::new(&normalized).starts_with()),
+            )
+            .into_values(),
         };
-        let block_id = usize::try_from(locator >> 32)
-            .map_err(|_| Error::Corrupt("posting block ID overflows usize".into()))?;
-        let record_offset = usize::try_from(locator & u64::from(u32::MAX))
-            .map_err(|_| Error::Corrupt("posting offset overflows usize".into()))?;
-        let posting_bytes = self.decode_posting_block(block_id)?;
-        decode_posting_record(
-            &posting_bytes,
-            record_offset,
-            self.metadata.unique_span_count,
-        )
+        if locators.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+
+        let mut posting_blocks = BTreeMap::<usize, Vec<u8>>::new();
+        let mut span_ids = HashSet::new();
+        let mut postings_bytes_decompressed = 0_u64;
+        for locator in locators {
+            let block_id = usize::try_from(locator >> 32)
+                .map_err(|_| Error::Corrupt("posting block ID overflows usize".into()))?;
+            let record_offset = usize::try_from(locator & u64::from(u32::MAX))
+                .map_err(|_| Error::Corrupt("posting offset overflows usize".into()))?;
+            if let std::collections::btree_map::Entry::Vacant(entry) =
+                posting_blocks.entry(block_id)
+            {
+                let bytes = self.decode_posting_block(block_id)?;
+                postings_bytes_decompressed = postings_bytes_decompressed
+                    .checked_add(bytes.len() as u64)
+                    .ok_or(Error::InvalidCoordinate)?;
+                entry.insert(bytes);
+            }
+            let posting_bytes = posting_blocks
+                .get(&block_id)
+                .ok_or_else(|| Error::Corrupt("missing decoded postings block".into()))?;
+            span_ids.extend(decode_posting_record(
+                posting_bytes,
+                record_offset,
+                self.metadata.unique_span_count,
+            )?);
+        }
+        let mut span_ids = span_ids.into_iter().collect::<Vec<_>>();
+        span_ids.sort_unstable();
+        Ok((span_ids, postings_bytes_decompressed))
     }
 
     /// Resolves one span ID using a binary search over fixed-width block entries.
@@ -3088,11 +3258,13 @@ impl NameIndexReader {
         let mut span_bytes_decompressed = 0_u64;
         for (block_index, rows) in requests.iter() {
             let entry = &self.span_directory[*block_index];
-            let payload = self.decode_span_block(*block_index)?;
+            let starts_payload = self.decode_starts_block(*block_index)?;
+            let lengths_payload = self.decode_lengths_block(*block_index)?;
             span_bytes_decompressed = span_bytes_decompressed
-                .checked_add(payload.len() as u64)
+                .checked_add(starts_payload.len() as u64)
+                .and_then(|total| total.checked_add(lengths_payload.len() as u64))
                 .ok_or(Error::InvalidCoordinate)?;
-            let decoded = decode_span_rows(&payload, entry)?;
+            let decoded = decode_span_rows(&starts_payload, &lengths_payload, entry)?;
             for &(output_index, row) in rows {
                 let span = *decoded
                     .get(row)
@@ -3112,7 +3284,7 @@ impl NameIndexReader {
         let section = self
             .sections
             .get(&kind)
-            .ok_or_else(|| Error::Corrupt("missing GNI section".into()))?;
+            .ok_or_else(|| Error::Corrupt("missing GAI section".into()))?;
         let end = section
             .offset
             .checked_add(section.length)
@@ -3145,25 +3317,47 @@ impl NameIndexReader {
         )
     }
 
-    fn decode_span_block(&self, block_id: usize) -> Result<Vec<u8>> {
+    fn decode_starts_block(&self, block_id: usize) -> Result<Vec<u8>> {
         let entry = self
             .span_directory
             .get(block_id)
             .ok_or_else(|| Error::Corrupt("invalid span block ID".into()))?;
-        let data = self.section(SectionKind::SpansData)?;
+        let data = self.section(SectionKind::StartsData)?;
         let end = entry
-            .compressed_offset
-            .checked_add(u64::from(entry.compressed_length))
+            .starts_compressed_offset
+            .checked_add(u64::from(entry.starts_compressed_length))
             .ok_or_else(|| Error::Corrupt("span block range overflow".into()))?;
         let compressed = data
-            .get(entry.compressed_offset as usize..end as usize)
-            .ok_or_else(|| Error::Corrupt("span block range out of bounds".into()))?;
+            .get(entry.starts_compressed_offset as usize..end as usize)
+            .ok_or_else(|| Error::Corrupt("starts block range out of bounds".into()))?;
         decompress_block(
             compressed,
-            entry.compression,
-            entry.uncompressed_length,
-            entry.checksum,
-            "span block",
+            entry.starts_compression,
+            entry.starts_uncompressed_length,
+            entry.starts_checksum,
+            "span starts block",
+        )
+    }
+
+    fn decode_lengths_block(&self, block_id: usize) -> Result<Vec<u8>> {
+        let entry = self
+            .span_directory
+            .get(block_id)
+            .ok_or_else(|| Error::Corrupt("invalid span block ID".into()))?;
+        let data = self.section(SectionKind::LengthsData)?;
+        let end = entry
+            .lengths_compressed_offset
+            .checked_add(u64::from(entry.lengths_compressed_length))
+            .ok_or_else(|| Error::Corrupt("span lengths range overflow".into()))?;
+        let compressed = data
+            .get(entry.lengths_compressed_offset as usize..end as usize)
+            .ok_or_else(|| Error::Corrupt("lengths block range out of bounds".into()))?;
+        decompress_block(
+            compressed,
+            entry.lengths_compression,
+            entry.lengths_uncompressed_length,
+            entry.lengths_checksum,
+            "span lengths block",
         )
     }
 }
@@ -3174,19 +3368,25 @@ fn decode_posting_record(
     span_count_limit: u64,
 ) -> Result<Vec<u64>> {
     let mut offset = record_offset;
-    if offset >= bytes.len() {
-        return Err(Error::Corrupt(
-            "posting record offset is outside block".into(),
-        ));
-    }
     let count = read_varint(bytes, &mut offset, "posting span count")?;
-    if count > span_count_limit || count > 100_000_000 {
+    if count > span_count_limit || count > 100_000_000 || count > MAX_BLOCK_BYTES / 8 {
         return Err(Error::Corrupt("excessive posting span count".into()));
     }
-    let mut ids = Vec::with_capacity(count as usize);
+    decode_delta_posting_record(bytes, &mut offset, count, span_count_limit)
+}
+
+fn decode_delta_posting_record(
+    bytes: &[u8],
+    offset: &mut usize,
+    count: u64,
+    span_count_limit: u64,
+) -> Result<Vec<u64>> {
+    let count = usize::try_from(count)
+        .map_err(|_| Error::Corrupt("posting span count overflows usize".into()))?;
+    let mut ids = Vec::with_capacity(count);
     let mut previous = 0_u64;
     for index in 0..count {
-        let value = read_varint(bytes, &mut offset, "posting span ID")?;
+        let value = read_varint(bytes, offset, "posting span ID")?;
         let id = if index == 0 {
             value
         } else {
@@ -3258,7 +3458,8 @@ fn decode_posting_directory(
 
 fn decode_span_directory(
     bytes: &[u8],
-    data_length: u64,
+    starts_data_length: u64,
+    lengths_data_length: u64,
     expected_count: u64,
     expected_span_count: u64,
     spans_per_block: u32,
@@ -3275,7 +3476,8 @@ fn decode_span_directory(
     let mut offset = 0;
     let mut entries = Vec::with_capacity(expected_count as usize);
     let mut previous_span_id = 0_u64;
-    let mut previous_data_end = 0_u64;
+    let mut previous_starts_data_end = 0_u64;
+    let mut previous_lengths_data_end = 0_u64;
     let mut previous_reference = None;
     let mut previous_start = 0_u64;
     let mut total_rows = 0_u64;
@@ -3284,23 +3486,34 @@ fn decode_span_directory(
         let span_count = read_u32(bytes, &mut offset, "span count")?;
         let reference_id = read_u32(bytes, &mut offset, "span reference ID")?;
         let first_start = read_u64(bytes, &mut offset, "span first start")?;
-        let compressed_offset = read_u64(bytes, &mut offset, "span compressed offset")?;
-        let compressed_length = read_u32(bytes, &mut offset, "span compressed length")?;
-        let uncompressed_length = read_u32(bytes, &mut offset, "span uncompressed length")?;
-        let checksum = read_u32(bytes, &mut offset, "span checksum")?;
+        let starts_compressed_offset =
+            read_u64(bytes, &mut offset, "span starts compressed offset")?;
+        let starts_compressed_length =
+            read_u32(bytes, &mut offset, "span starts compressed length")?;
+        let starts_uncompressed_length =
+            read_u32(bytes, &mut offset, "span starts uncompressed length")?;
+        let starts_checksum = read_u32(bytes, &mut offset, "span starts checksum")?;
+        let lengths_compressed_offset =
+            read_u64(bytes, &mut offset, "span lengths compressed offset")?;
+        let lengths_compressed_length =
+            read_u32(bytes, &mut offset, "span lengths compressed length")?;
+        let lengths_uncompressed_length =
+            read_u32(bytes, &mut offset, "span lengths uncompressed length")?;
+        let lengths_checksum = read_u32(bytes, &mut offset, "span lengths checksum")?;
         let start_encoding = read_u8(bytes, &mut offset, "span start encoding")?;
         let length_encoding = read_u8(bytes, &mut offset, "span length encoding")?;
-        let compression = read_u8(bytes, &mut offset, "span compression")?;
-        let reserved = read_u8(bytes, &mut offset, "span reserved")?;
-        let reserved_tail = read_u32(bytes, &mut offset, "span reserved tail")?;
+        let starts_compression = read_u8(bytes, &mut offset, "span starts compression")?;
+        let lengths_compression = read_u8(bytes, &mut offset, "span lengths compression")?;
+        let reserved = read_u32(bytes, &mut offset, "span reserved")?;
         if span_count == 0
             || span_count > spans_per_block
             || reference_id >= reference_count
-            || start_encoding > 2
+            || start_encoding != START_ENCODING_DELTA
+            || length_encoding == 1
             || length_encoding > 2
-            || compression > 1
+            || starts_compression > 1
+            || lengths_compression > 1
             || reserved != 0
-            || reserved_tail != 0
         {
             return Err(Error::Corrupt("invalid span directory entry".into()));
         }
@@ -3318,13 +3531,30 @@ fn decode_span_directory(
                 "span directory is not coordinate ordered".into(),
             ));
         }
-        let end = compressed_offset
-            .checked_add(u64::from(compressed_length))
+        let starts_end = starts_compressed_offset
+            .checked_add(u64::from(starts_compressed_length))
             .ok_or_else(|| Error::Corrupt("span block range overflow".into()))?;
-        if compressed_offset < previous_data_end || end > data_length {
-            return Err(Error::Corrupt("span block is outside data section".into()));
+        if starts_compressed_offset < previous_starts_data_end || starts_end > starts_data_length {
+            return Err(Error::Corrupt(
+                "span starts block is outside data section".into(),
+            ));
         }
-        if u64::from(uncompressed_length) > MAX_BLOCK_BYTES {
+        let lengths_end = lengths_compressed_offset
+            .checked_add(u64::from(lengths_compressed_length))
+            .ok_or_else(|| Error::Corrupt("span lengths range overflow".into()))?;
+        if lengths_compressed_offset < previous_lengths_data_end
+            || lengths_end > lengths_data_length
+        {
+            return Err(Error::Corrupt(
+                "span lengths block is outside data section".into(),
+            ));
+        }
+        if (span_count > 1 && starts_compressed_length == 0)
+            || lengths_compressed_length == 0
+            || lengths_uncompressed_length < LENGTH_PAYLOAD_HEADER_SIZE as u32
+            || u64::from(starts_uncompressed_length) > MAX_BLOCK_BYTES
+            || u64::from(lengths_uncompressed_length) > MAX_BLOCK_BYTES
+        {
             return Err(Error::Corrupt("span block is too large".into()));
         }
         total_rows = total_rows
@@ -3333,7 +3563,8 @@ fn decode_span_directory(
         previous_span_id = first_span_id
             .checked_add(u64::from(span_count))
             .ok_or_else(|| Error::Corrupt("span ID range overflow".into()))?;
-        previous_data_end = end;
+        previous_starts_data_end = starts_end;
+        previous_lengths_data_end = lengths_end;
         previous_reference = Some(reference_id);
         previous_start = first_start;
         entries.push(SpanDirectoryEntry {
@@ -3341,13 +3572,18 @@ fn decode_span_directory(
             span_count,
             reference_id,
             first_start,
-            compressed_offset,
-            compressed_length,
-            uncompressed_length,
-            checksum,
+            starts_compressed_offset,
+            starts_compressed_length,
+            starts_uncompressed_length,
+            starts_checksum,
+            lengths_compressed_offset,
+            lengths_compressed_length,
+            lengths_uncompressed_length,
+            lengths_checksum,
             start_encoding,
             length_encoding,
-            compression,
+            starts_compression,
+            lengths_compression,
         });
     }
     if total_rows != expected_span_count {
@@ -3385,6 +3621,13 @@ fn decode_for_stream(
         .get(*offset..end)
         .ok_or_else(|| Error::Corrupt(format!("truncated {context}")))?;
     *offset = end;
+    if bit_count % 8 != 0 {
+        let used = bit_count % 8;
+        let padding_mask = !((1_u8 << used) - 1);
+        if packed.last().copied().unwrap_or(0) & padding_mask != 0 {
+            return Err(Error::Corrupt(format!("nonzero padding bits in {context}")));
+        }
+    }
     let mut values = Vec::with_capacity(count);
     for index in 0..count {
         let bit_offset = index
@@ -3405,107 +3648,69 @@ fn decode_for_stream(
     Ok(values)
 }
 
-fn decode_span_rows(payload: &[u8], entry: &SpanDirectoryEntry) -> Result<Vec<Span>> {
+fn decode_delta_start_payload(payload: &[u8], entry: &SpanDirectoryEntry) -> Result<Vec<u64>> {
+    let count = usize::try_from(entry.span_count)
+        .map_err(|_| Error::Corrupt("span start count overflows usize".into()))?;
+    if count == 0 || count > 100_000_000 {
+        return Err(Error::Corrupt("invalid span start count".into()));
+    }
+    if payload.len() as u64 > MAX_BLOCK_BYTES {
+        return Err(Error::Corrupt("span start payload is too large".into()));
+    }
+    let mut starts = Vec::with_capacity(count);
+    starts.push(entry.first_start);
+    let mut offset = 0_usize;
+    let mut previous = entry.first_start;
+    for _ in 1..count {
+        let delta = read_canonical_varint(payload, &mut offset, "span start delta")?;
+        previous = previous
+            .checked_add(delta)
+            .ok_or_else(|| Error::Corrupt("span start overflows coordinate".into()))?;
+        starts.push(previous);
+    }
+    if offset != payload.len() {
+        return Err(Error::Corrupt("trailing span start bytes".into()));
+    }
+    Ok(starts)
+}
+
+fn decode_length_payload(payload: &[u8], entry: &SpanDirectoryEntry) -> Result<Vec<u64>> {
+    if payload.len() < LENGTH_PAYLOAD_HEADER_SIZE {
+        return Err(Error::Corrupt("truncated span length payload".into()));
+    }
     let mut offset = 0;
-    let start_length = read_u32(payload, &mut offset, "span start stream length")? as usize;
-    let length_length = read_u32(payload, &mut offset, "span length stream length")? as usize;
-    let length_base = read_u64(payload, &mut offset, "span length base")?;
-    let start_encoding = read_u8(payload, &mut offset, "span payload start encoding")?;
-    let length_encoding = read_u8(payload, &mut offset, "span payload length encoding")?;
-    let start_bit_width = read_u8(payload, &mut offset, "span start bit width")?;
-    let length_bit_width = read_u8(payload, &mut offset, "span length bit width")?;
-    let start_base = entry.first_start;
-    if start_encoding != entry.start_encoding || length_encoding != entry.length_encoding {
-        return Err(Error::Corrupt("span payload metadata mismatch".into()));
-    }
-    if (start_encoding != 2 && start_bit_width != 0)
-        || (length_encoding != 2 && length_bit_width != 0)
-        || (length_encoding != 2 && length_base != 0)
+    let count = read_u32(payload, &mut offset, "span length count")?;
+    let encoding = read_u8(payload, &mut offset, "span length encoding")?;
+    let bit_width = read_u8(payload, &mut offset, "span length bit width")?;
+    let reserved = read_u16(payload, &mut offset, "span length reserved")?;
+    let base = read_u64(payload, &mut offset, "span length base")?;
+    let stream_length = read_u32(payload, &mut offset, "span length stream length")? as usize;
+    if reserved != 0
+        || count == 0
+        || count != entry.span_count
+        || encoding != entry.length_encoding
+        || encoding == 1
+        || encoding > 2
     {
-        return Err(Error::Corrupt("invalid span payload metadata".into()));
+        return Err(Error::Corrupt("invalid span length metadata".into()));
     }
-    let count = entry.span_count as usize;
-    let starts = match start_encoding {
+    if encoding == 0 && (bit_width != 0 || base != 0) {
+        return Err(Error::Corrupt("invalid varint length metadata".into()));
+    }
+    if encoding == 2 && bit_width > 63 {
+        return Err(Error::Corrupt("invalid FOR length bit width".into()));
+    }
+    let end = LENGTH_PAYLOAD_HEADER_SIZE
+        .checked_add(stream_length)
+        .ok_or_else(|| Error::Corrupt("span length range overflow".into()))?;
+    if end != payload.len() {
+        return Err(Error::Corrupt("span length stream length mismatch".into()));
+    }
+    let count = usize::try_from(count)
+        .map_err(|_| Error::Corrupt("span length count overflows usize".into()))?;
+    let stream = &payload[LENGTH_PAYLOAD_HEADER_SIZE..end];
+    let lengths = match encoding {
         0 => {
-            let end = offset
-                .checked_add(start_length)
-                .ok_or_else(|| Error::Corrupt("span start range overflow".into()))?;
-            let stream = payload
-                .get(offset..end)
-                .ok_or_else(|| Error::Corrupt("truncated span start stream".into()))?;
-            offset = end;
-            let mut stream_offset = 0;
-            let mut values = Vec::with_capacity(count);
-            for _ in 0..count {
-                values.push(read_varint(stream, &mut stream_offset, "span start")?);
-            }
-            if stream_offset != stream.len() {
-                return Err(Error::Corrupt("trailing span start bytes".into()));
-            }
-            values
-        }
-        1 => {
-            if count == 0 {
-                return Err(Error::Corrupt("empty span block".into()));
-            }
-            let end = offset
-                .checked_add(start_length)
-                .ok_or_else(|| Error::Corrupt("span start range overflow".into()))?;
-            let stream = payload
-                .get(offset..end)
-                .ok_or_else(|| Error::Corrupt("truncated span start stream".into()))?;
-            offset = end;
-            let mut stream_offset = 0;
-            let mut values = Vec::with_capacity(count);
-            values.push(start_base);
-            let mut previous = start_base;
-            for _ in 1..count {
-                let delta = read_varint(stream, &mut stream_offset, "span start delta")?;
-                let value = previous
-                    .checked_add(delta)
-                    .ok_or_else(|| Error::Corrupt("span start overflow".into()))?;
-                values.push(value);
-                previous = value;
-            }
-            if stream_offset != stream.len() {
-                return Err(Error::Corrupt("trailing span start bytes".into()));
-            }
-            values
-        }
-        2 => {
-            if count == 0 {
-                return Err(Error::Corrupt("empty span block".into()));
-            }
-            let mut values = Vec::with_capacity(count);
-            values.push(start_base);
-            for relative in decode_for_stream(
-                payload,
-                &mut offset,
-                start_length,
-                count - 1,
-                0,
-                start_bit_width,
-                "span start",
-            )? {
-                values.push(
-                    start_base
-                        .checked_add(relative)
-                        .ok_or_else(|| Error::Corrupt("span start overflow".into()))?,
-                );
-            }
-            values
-        }
-        _ => return Err(Error::Corrupt("unknown span start encoding".into())),
-    };
-    let lengths = match length_encoding {
-        0 => {
-            let end = offset
-                .checked_add(length_length)
-                .ok_or_else(|| Error::Corrupt("span length range overflow".into()))?;
-            let stream = payload
-                .get(offset..end)
-                .ok_or_else(|| Error::Corrupt("truncated span length stream".into()))?;
-            offset = end;
             let mut stream_offset = 0;
             let mut values = Vec::with_capacity(count);
             for _ in 0..count {
@@ -3516,81 +3721,70 @@ fn decode_span_rows(payload: &[u8], entry: &SpanDirectoryEntry) -> Result<Vec<Sp
             }
             values
         }
-        1 => {
-            let end = offset
-                .checked_add(length_length)
-                .ok_or_else(|| Error::Corrupt("span length range overflow".into()))?;
-            let stream = payload
-                .get(offset..end)
-                .ok_or_else(|| Error::Corrupt("truncated span length stream".into()))?;
-            offset = end;
+        2 => {
             let mut stream_offset = 0;
-            let mut values = Vec::with_capacity(count);
-            let mut previous = 0_u64;
-            for index in 0..count {
-                let delta = read_varint(stream, &mut stream_offset, "span length delta")?;
-                let value = if index == 0 {
-                    delta
-                } else {
-                    previous
-                        .checked_add(delta)
-                        .ok_or_else(|| Error::Corrupt("span length overflow".into()))?
-                };
-                values.push(value);
-                previous = value;
-            }
+            let values = decode_for_stream(
+                stream,
+                &mut stream_offset,
+                stream.len(),
+                count,
+                base,
+                bit_width,
+                "span length",
+            )?;
             if stream_offset != stream.len() {
                 return Err(Error::Corrupt("trailing span length bytes".into()));
             }
             values
         }
-        2 => decode_for_stream(
-            payload,
-            &mut offset,
-            length_length,
-            count,
-            length_base,
-            length_bit_width,
-            "span length",
-        )?,
         _ => return Err(Error::Corrupt("unknown span length encoding".into())),
     };
-    if offset != payload.len() {
-        return Err(Error::Corrupt("trailing span payload bytes".into()));
+    if lengths.contains(&0) {
+        return Err(Error::Corrupt("span length is zero".into()));
     }
-    if starts.first().copied() != Some(entry.first_start)
-        || starts.windows(2).any(|values| values[0] > values[1])
-    {
-        return Err(Error::Corrupt(
-            "span starts are not coordinate ordered".into(),
-        ));
+    Ok(lengths)
+}
+
+fn decode_span_rows(
+    starts_payload: &[u8],
+    lengths_payload: &[u8],
+    entry: &SpanDirectoryEntry,
+) -> Result<Vec<Span>> {
+    let starts = decode_delta_start_payload(starts_payload, entry)?;
+    let lengths = decode_length_payload(lengths_payload, entry)?;
+    if starts.len() != lengths.len() {
+        return Err(Error::Corrupt("span component row count mismatch".into()));
     }
-    for (start, length) in starts.iter().zip(&lengths) {
-        if *length == 0 {
-            return Err(Error::Corrupt("span length is zero".into()));
-        }
-        start.checked_add(*length).ok_or(Error::InvalidCoordinate)?;
-    }
-    Ok(starts
+    starts
         .into_iter()
         .zip(lengths)
-        .map(|(start, length)| Span {
-            reference_id: entry.reference_id,
-            start,
-            length,
+        .map(|(start, length)| {
+            start
+                .checked_add(length)
+                .ok_or(Error::InvalidCoordinate)
+                .map(|_| Span {
+                    reference_id: entry.reference_id,
+                    start,
+                    length,
+                })
         })
-        .collect())
+        .collect()
 }
 
 #[cfg(test)]
-fn decode_span_row(payload: &[u8], entry: &SpanDirectoryEntry, row: usize) -> Result<Span> {
-    decode_span_rows(payload, entry)?
+fn decode_span_row(
+    starts_payload: &[u8],
+    lengths_payload: &[u8],
+    entry: &SpanDirectoryEntry,
+    row: usize,
+) -> Result<Span> {
+    decode_span_rows(starts_payload, lengths_payload, entry)?
         .get(row)
         .copied()
         .ok_or_else(|| Error::Corrupt("span row is out of bounds".into()))
 }
 
-/// An indexed GFF3 source, its TBI/CSI coordinate index, and a GNI reader.
+/// An indexed GFF3 source, its TBI/CSI coordinate index, and a GAI reader.
 pub struct IndexedGff {
     gff_path: PathBuf,
     coordinate_index_path: PathBuf,
@@ -3602,17 +3796,17 @@ pub struct IndexedGff {
 }
 
 impl IndexedGff {
-    /// Opens a source, coordinate index, and GNI and rejects stale pairs by
+    /// Opens a source, coordinate index, and GAI and rejects stale pairs by
     /// checking all source, index, and reference-dictionary fingerprints.
     pub fn open(
         gff_path: impl AsRef<Path>,
         coordinate_index_path: impl AsRef<Path>,
-        gni_path: impl AsRef<Path>,
+        gai_path: impl AsRef<Path>,
     ) -> Result<Self> {
         Self::open_inner(
             gff_path.as_ref(),
             coordinate_index_path.as_ref(),
-            gni_path.as_ref(),
+            gai_path.as_ref(),
             None,
         )
     }
@@ -3622,14 +3816,14 @@ impl IndexedGff {
     pub fn open_with_options(
         gff_path: impl AsRef<Path>,
         coordinate_index_path: impl AsRef<Path>,
-        gni_path: impl AsRef<Path>,
+        gai_path: impl AsRef<Path>,
         options: &NameIndexOptions,
     ) -> Result<Self> {
         let options = NameIndexOptions::new(options.attributes.clone(), options.case_sensitive)?;
         Self::open_inner(
             gff_path.as_ref(),
             coordinate_index_path.as_ref(),
-            gni_path.as_ref(),
+            gai_path.as_ref(),
             Some(&options),
         )
     }
@@ -3637,12 +3831,12 @@ impl IndexedGff {
     fn open_inner(
         gff_path: &Path,
         coordinate_index_path: &Path,
-        gni_path: &Path,
+        gai_path: &Path,
         options: Option<&NameIndexOptions>,
     ) -> Result<Self> {
         let gff_path = gff_path.to_path_buf();
         let coordinate_index_path = coordinate_index_path.to_path_buf();
-        let name_index = NameIndexReader::open_mmap(gni_path)?;
+        let name_index = NameIndexReader::open_mmap(gai_path)?;
         let (coordinate_index, coordinate_index_fingerprint) =
             read_coordinate_index_with_fingerprint(&coordinate_index_path)?;
         let dictionary = coordinate_index.dictionary()?;
@@ -3662,7 +3856,7 @@ impl IndexedGff {
                 .map_err(|_| Error::Corrupt("reference dictionary is too large".into()))?
         {
             return Err(Error::Corrupt(
-                "GNI reference count does not match coordinate index".into(),
+                "GAI reference count does not match coordinate index".into(),
             ));
         }
         if let Some(options) = options
@@ -3670,7 +3864,7 @@ impl IndexedGff {
                 || options.case_sensitive != name_index.metadata.case_sensitive)
         {
             return Err(Error::Stale(
-                "configured attributes or normalization policy does not match GNI".into(),
+                "configured attributes or normalization policy does not match GAI".into(),
             ));
         }
         for span_directory_entry in &name_index.span_directory {
@@ -3701,28 +3895,52 @@ impl IndexedGff {
         })
     }
 
-    /// Returns GNI metadata.
+    /// Returns GAI metadata.
     pub fn metadata(&self) -> &IndexMetadata {
         self.name_index.metadata()
     }
 
-    /// Queries a configured attribute value and returns matching records in
-    /// source coordinate order. Each posted span is queried as an exact
-    /// coordinate interval; returned chunks are then merged and read once.
-    /// Unknown terms are successful empty queries.
+    /// Queries a configured attribute value exactly and returns matching
+    /// records in source coordinate order. Each posted span is queried as an
+    /// exact coordinate interval; returned chunks are then merged and read
+    /// once. Unknown terms are successful empty queries.
     pub fn query_name(&mut self, term: &str) -> Result<Vec<GffRecord>> {
-        self.query_name_with_stats(term).map(|(records, _)| records)
+        self.query_name_with_mode(term, MatchMode::Exact)
     }
 
-    /// Queries a configured attribute value and returns records plus bounded
-    /// query instrumentation. The instrumentation is useful for measuring
-    /// index amplification without changing ordinary CLI output.
+    /// Queries a configured attribute value exactly and returns records plus
+    /// bounded query instrumentation.
     pub fn query_name_with_stats(&mut self, term: &str) -> Result<(Vec<GffRecord>, QueryStats)> {
+        self.query_name_with_mode_and_stats(term, MatchMode::Exact)
+    }
+
+    /// Queries a configured attribute value using an explicit match mode.
+    /// Prefix mode streams every indexed value beginning with the normalized
+    /// query from the FST, unions their spans, and uses the same batched
+    /// TBI/CSI retrieval as exact queries.
+    pub fn query_name_with_mode(
+        &mut self,
+        term: &str,
+        match_mode: MatchMode,
+    ) -> Result<Vec<GffRecord>> {
+        self.query_name_with_mode_and_stats(term, match_mode)
+            .map(|(records, _)| records)
+    }
+
+    /// Queries a configured attribute value using an explicit match mode and
+    /// returns bounded query instrumentation.
+    pub fn query_name_with_mode_and_stats(
+        &mut self,
+        term: &str,
+        match_mode: MatchMode,
+    ) -> Result<(Vec<GffRecord>, QueryStats)> {
         let normalized_query = normalize_value(term, self.name_index.metadata.case_sensitive);
         if normalized_query.is_empty() {
             return Ok((Vec::new(), QueryStats::default()));
         }
-        let span_ids = self.name_index.lookup_span_ids(&normalized_query)?;
+        let span_ids = self
+            .name_index
+            .lookup_span_ids_with_mode(&normalized_query, match_mode)?;
         let mut stats = QueryStats {
             requested_spans: span_ids.len() as u64,
             ..QueryStats::default()
@@ -3781,6 +3999,7 @@ impl IndexedGff {
             configured_attributes: &self.configured_attributes,
             case_sensitive: self.name_index.metadata.case_sensitive,
             normalized_query: &normalized_query,
+            match_mode,
         };
         let records = read_query_chunks(&self.gff_path, &merged_chunks, &context, &mut stats)?;
         Ok((records, stats))
@@ -3791,7 +4010,7 @@ impl IndexedGff {
         &self.coordinate_index_path
     }
 
-    /// Returns the GNI reader for callers needing direct span lookup.
+    /// Returns the GAI reader for callers needing direct span lookup.
     pub fn name_index(&self) -> &NameIndexReader {
         &self.name_index
     }
@@ -3820,6 +4039,7 @@ struct QueryReadContext<'a> {
     configured_attributes: &'a HashSet<String>,
     case_sensitive: bool,
     normalized_query: &'a str,
+    match_mode: MatchMode,
 }
 
 fn read_query_chunks(
@@ -3866,6 +4086,7 @@ fn read_query_chunks(
                 context.configured_attributes,
                 context.case_sensitive,
                 context.normalized_query,
+                context.match_mode,
             )? {
                 continue;
             }
@@ -4036,7 +4257,8 @@ mod tests {
     fn mutate_section(bytes: &mut [u8], kind: SectionKind, mutate: impl FnOnce(&mut [u8])) {
         let directory_offset =
             usize::try_from(u64::from_le_bytes(bytes[176..184].try_into().unwrap())).unwrap();
-        for index in 0..6 {
+        let section_count = u32::from_le_bytes(bytes[24..28].try_into().unwrap()) as usize;
+        for index in 0..section_count {
             let entry = directory_offset + index * DIRECTORY_ENTRY_SIZE;
             let entry_kind = u32::from_le_bytes(bytes[entry..entry + 4].try_into().unwrap());
             if entry_kind != kind as u32 {
@@ -4062,7 +4284,8 @@ mod tests {
     fn mutate_section_directory_item_count(bytes: &mut [u8], kind: SectionKind, count: u64) {
         let directory_offset =
             usize::try_from(u64::from_le_bytes(bytes[176..184].try_into().unwrap())).unwrap();
-        for index in 0..6 {
+        let section_count = u32::from_le_bytes(bytes[24..28].try_into().unwrap()) as usize;
+        for index in 0..section_count {
             let entry = directory_offset + index * DIRECTORY_ENTRY_SIZE;
             let entry_kind = u32::from_le_bytes(bytes[entry..entry + 4].try_into().unwrap());
             if entry_kind == kind as u32 {
@@ -4076,7 +4299,8 @@ mod tests {
     fn mutate_section_directory_offset(bytes: &mut [u8], kind: SectionKind, offset: u64) {
         let directory_offset =
             usize::try_from(u64::from_le_bytes(bytes[176..184].try_into().unwrap())).unwrap();
-        for index in 0..6 {
+        let section_count = u32::from_le_bytes(bytes[24..28].try_into().unwrap()) as usize;
+        for index in 0..section_count {
             let entry = directory_offset + index * DIRECTORY_ENTRY_SIZE;
             let entry_kind = u32::from_le_bytes(bytes[entry..entry + 4].try_into().unwrap());
             if entry_kind == kind as u32 {
@@ -4091,14 +4315,14 @@ mod tests {
     fn test_name_index_round_trip_and_query() {
         let directory = tempdir().expect("should create temp directory");
         let (source, coordinate_index) = write_fixture(directory.path());
-        let destination = directory.path().join("fixture.gni");
+        let destination = directory.path().join("fixture.gai");
         let options = NameIndexOptions::new(["Name", "Alias", "gene_name", "Name"], false)
             .expect("should validate attributes");
         let stats = build_name_index(&source, &coordinate_index, &destination, &options)
-            .expect("should build GNI");
-        let second_destination = directory.path().join("fixture-second.gni");
+            .expect("should build GAI");
+        let second_destination = directory.path().join("fixture-second.gai");
         build_name_index(&source, &coordinate_index, &second_destination, &options)
-            .expect("should rebuild GNI deterministically");
+            .expect("should rebuild GAI deterministically");
         assert_eq!(
             fs::read(&destination).unwrap(),
             fs::read(&second_destination).unwrap()
@@ -4107,14 +4331,26 @@ mod tests {
         assert_eq!(stats.records_indexed, 4);
         assert_eq!(stats.distinct_terms, 4);
         assert_eq!(stats.unique_spans, 3);
-
-        let reader = NameIndexReader::open(&destination).expect("should open GNI");
-        let mapped = NameIndexReader::open_mmap(&destination).expect("should mmap GNI");
+        let reader = NameIndexReader::open(&destination).expect("should open GAI");
+        assert_eq!(reader.metadata().minor_version, 0);
+        let mapped = NameIndexReader::open_mmap(&destination).expect("should mmap GAI");
         assert_eq!(mapped.lookup_span_ids("BRCA1").unwrap(), vec![0, 2]);
         assert_eq!(reader.lookup_span_ids("BRCA1").unwrap(), vec![0, 2]);
         assert_eq!(reader.lookup_span_ids("brcc1").unwrap(), vec![0]);
         assert_eq!(reader.lookup_span_ids("rnf53").unwrap(), vec![0]);
         assert_eq!(reader.lookup_span_ids("other gene").unwrap(), vec![1]);
+        assert_eq!(
+            reader
+                .lookup_span_ids_with_mode("br", MatchMode::Prefix)
+                .unwrap(),
+            vec![0, 2]
+        );
+        assert_eq!(
+            reader
+                .lookup_span_ids_with_mode("brcc", MatchMode::Prefix)
+                .unwrap(),
+            vec![0]
+        );
         assert_eq!(reader.resolve_span_id(0).unwrap().start, 99);
         assert_eq!(reader.resolve_span_id(0).unwrap().length, 51);
         assert!(
@@ -4130,7 +4366,31 @@ mod tests {
         assert_eq!(records.len(), 3);
         assert_eq!(records[0].start, 100);
         assert_eq!(records[2].reference_sequence_name, "chr2");
+        let (prefix_records, prefix_stats) = indexed
+            .query_name_with_mode_and_stats(" br ", MatchMode::Prefix)
+            .expect("should query prefix");
+        assert_eq!(prefix_records.len(), 3);
+        assert_eq!(prefix_stats.requested_spans, 2);
+        assert_eq!(prefix_stats.exact_interval_queries, 2);
+        assert_eq!(prefix_stats.matching_records, 3);
+        assert_eq!(
+            prefix_records
+                .iter()
+                .map(|record| record.raw_line.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                fixture_records()[2],
+                fixture_records()[3],
+                fixture_records()[5]
+            ]
+        );
         assert!(indexed.query_name("missing").unwrap().is_empty());
+        assert!(
+            indexed
+                .query_name_with_mode("missing", MatchMode::Prefix)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -4142,24 +4402,40 @@ mod tests {
         assert_eq!(normalize_value("  BRCA1\u{2003}", true), "BRCA1");
         let directory = tempdir().expect("should create temp directory");
         let (source, coordinate_index) = write_fixture(directory.path());
-        let destination = directory.path().join("case-sensitive.gni");
+        let destination = directory.path().join("case-sensitive.gai");
         let options = NameIndexOptions::new(["Name"], true).expect("should validate attributes");
         build_name_index(&source, &coordinate_index, &destination, &options)
-            .expect("should build case-sensitive GNI");
-        let reader = NameIndexReader::open(destination).expect("should open GNI");
+            .expect("should build case-sensitive GAI");
+        let reader = NameIndexReader::open(destination).expect("should open GAI");
         assert!(reader.lookup_span_ids("brca1").unwrap().is_empty());
         assert_eq!(reader.lookup_span_ids("BRCA1").unwrap(), vec![0, 2]);
+        assert!(
+            reader
+                .lookup_span_ids_with_mode("br", MatchMode::Prefix)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            reader
+                .lookup_span_ids_with_mode("BR", MatchMode::Prefix)
+                .unwrap(),
+            vec![0, 2]
+        );
     }
 
     #[test]
     fn test_corruption_is_an_error() {
         let directory = tempdir().expect("should create temp directory");
         let (source, coordinate_index) = write_fixture(directory.path());
-        let destination = directory.path().join("fixture.gni");
+        let destination = directory.path().join("fixture.gai");
         let options = NameIndexOptions::new(["Name"], false).expect("should validate attributes");
         build_name_index(&source, &coordinate_index, &destination, &options)
-            .expect("should build GNI");
-        let mut bytes = fs::read(&destination).expect("should read GNI");
+            .expect("should build GAI");
+        let mut bytes = fs::read(&destination).expect("should read GAI");
+        assert_eq!(&bytes[..4], b"GAI\x01");
+        let mut legacy_magic = bytes.clone();
+        legacy_magic[..4].copy_from_slice(&[b'G', b'N', b'I', 1]);
+        assert!(NameIndexReader::from_bytes(legacy_magic).is_err());
         bytes[0] = b'X';
         assert!(NameIndexReader::from_bytes(bytes).is_err());
         let stale_source = directory.path().join("stale.gff3.gz");
@@ -4212,6 +4488,17 @@ mod tests {
 
     #[test]
     fn test_adaptive_span_encodings_round_trip() {
+        let example = [10_u64, 10, 15, 20]
+            .into_iter()
+            .map(|start| SpanKey {
+                reference_id: 0,
+                start,
+                length: 1,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(example[0].start, 10);
+        assert_eq!(encode_delta_start_payload(&example).unwrap(), vec![0, 5, 5]);
+
         let packed_values = (0..64)
             .map(|index| SpanKey {
                 reference_id: 7,
@@ -4219,31 +4506,34 @@ mod tests {
                 length: 100 + index % 3,
             })
             .collect::<Vec<_>>();
-        let (packed_payload, start_encoding, length_encoding, first_start) =
-            encode_span_block(&packed_values).expect("should encode packed spans");
-        assert_eq!(start_encoding, 2, "clustered starts should use FOR");
-        assert_eq!(length_encoding, 2, "constant lengths should use FOR");
+        let packed_starts = encode_delta_start_payload(&packed_values).unwrap();
+        let (packed_lengths, packed_length_encoding) =
+            encode_length_payload(&packed_values).unwrap();
         assert_eq!(
-            u32::from_le_bytes(packed_payload[..4].try_into().unwrap()) as usize,
-            ((packed_values.len() - 1) * 5).div_ceil(8),
-            "the FOR start stream omits the directory-stored first row"
+            packed_length_encoding, 2,
+            "clustered lengths should use FOR"
         );
         let packed_entry = SpanDirectoryEntry {
             first_span_id: 0,
             span_count: packed_values.len() as u32,
             reference_id: 7,
-            first_start,
-            compressed_offset: 0,
-            compressed_length: packed_payload.len() as u32,
-            uncompressed_length: packed_payload.len() as u32,
-            checksum: checksum(&packed_payload),
-            start_encoding,
-            length_encoding,
-            compression: 0,
+            first_start: packed_values[0].start,
+            starts_compressed_offset: 0,
+            starts_compressed_length: packed_starts.len() as u32,
+            starts_uncompressed_length: packed_starts.len() as u32,
+            starts_checksum: checksum(&packed_starts),
+            lengths_compressed_offset: 0,
+            lengths_compressed_length: packed_lengths.len() as u32,
+            lengths_uncompressed_length: packed_lengths.len() as u32,
+            lengths_checksum: checksum(&packed_lengths),
+            start_encoding: START_ENCODING_DELTA,
+            length_encoding: packed_length_encoding,
+            starts_compression: 0,
+            lengths_compression: 0,
         };
         for (row, expected) in packed_values.iter().enumerate() {
             assert_eq!(
-                decode_span_row(&packed_payload, &packed_entry, row).unwrap(),
+                decode_span_row(&packed_starts, &packed_lengths, &packed_entry, row).unwrap(),
                 Span::from(*expected)
             );
         }
@@ -4260,32 +4550,80 @@ mod tests {
                 length: 1_u64 << 40,
             },
         ];
-        let (varint_payload, start_encoding, length_encoding, first_start) =
-            encode_span_block(&varint_values).expect("should encode sparse spans");
+        let varint_starts = encode_delta_start_payload(&varint_values).unwrap();
+        let (varint_lengths, varint_length_encoding) =
+            encode_length_payload(&varint_values).unwrap();
         assert_eq!(
-            start_encoding, 2,
-            "the exact FOR stream should win for this gap"
+            varint_length_encoding, 0,
+            "sparse lengths should use varints"
         );
-        assert_eq!(length_encoding, 0, "sparse lengths should use varints");
         let varint_entry = SpanDirectoryEntry {
             first_span_id: 0,
             span_count: 2,
             reference_id: 7,
-            first_start,
-            compressed_offset: 0,
-            compressed_length: varint_payload.len() as u32,
-            uncompressed_length: varint_payload.len() as u32,
-            checksum: checksum(&varint_payload),
-            start_encoding,
-            length_encoding,
-            compression: 0,
+            first_start: varint_values[0].start,
+            starts_compressed_offset: 0,
+            starts_compressed_length: varint_starts.len() as u32,
+            starts_uncompressed_length: varint_starts.len() as u32,
+            starts_checksum: checksum(&varint_starts),
+            lengths_compressed_offset: 0,
+            lengths_compressed_length: varint_lengths.len() as u32,
+            lengths_uncompressed_length: varint_lengths.len() as u32,
+            lengths_checksum: checksum(&varint_lengths),
+            start_encoding: START_ENCODING_DELTA,
+            length_encoding: varint_length_encoding,
+            starts_compression: 0,
+            lengths_compression: 0,
         };
         for (row, expected) in varint_values.iter().enumerate() {
             assert_eq!(
-                decode_span_row(&varint_payload, &varint_entry, row).unwrap(),
+                decode_span_row(&varint_starts, &varint_lengths, &varint_entry, row).unwrap(),
                 Span::from(*expected)
             );
         }
+
+        let equal_start_values = (0..4)
+            .map(|index| SpanKey {
+                reference_id: 7,
+                start: 77,
+                length: index + 1,
+            })
+            .collect::<Vec<_>>();
+        let equal_starts = encode_delta_start_payload(&equal_start_values).unwrap();
+        let equal_entry = SpanDirectoryEntry {
+            first_span_id: 0,
+            span_count: 4,
+            reference_id: 7,
+            first_start: 77,
+            starts_compressed_offset: 0,
+            starts_compressed_length: equal_starts.len() as u32,
+            starts_uncompressed_length: equal_starts.len() as u32,
+            starts_checksum: checksum(&equal_starts),
+            lengths_compressed_offset: 0,
+            lengths_compressed_length: 0,
+            lengths_uncompressed_length: 0,
+            lengths_checksum: 0,
+            start_encoding: START_ENCODING_DELTA,
+            length_encoding: 0,
+            starts_compression: 0,
+            lengths_compression: 0,
+        };
+        let (equal_lengths, equal_encoding) = encode_length_payload(&equal_start_values).unwrap();
+        let equal_entry = SpanDirectoryEntry {
+            lengths_compressed_length: equal_lengths.len() as u32,
+            lengths_uncompressed_length: equal_lengths.len() as u32,
+            lengths_checksum: checksum(&equal_lengths),
+            length_encoding: equal_encoding,
+            ..equal_entry
+        };
+        assert_eq!(
+            decode_span_rows(&equal_starts, &equal_lengths, &equal_entry)
+                .unwrap()
+                .iter()
+                .map(|span| span.start)
+                .collect::<Vec<_>>(),
+            vec![77; 4]
+        );
 
         let values = [100_u64, 101, 103, 103];
         let (packed, base, width) = encode_for_values(&values).unwrap();
@@ -4313,6 +4651,111 @@ mod tests {
     }
 
     #[test]
+    fn test_delta_start_payload_rejects_malformed_payloads_without_unbounded_work() {
+        let values = [
+            SpanKey {
+                reference_id: 2,
+                start: 100,
+                length: 5,
+            },
+            SpanKey {
+                reference_id: 2,
+                start: 101,
+                length: 6,
+            },
+            SpanKey {
+                reference_id: 2,
+                start: 103,
+                length: 7,
+            },
+            SpanKey {
+                reference_id: 2,
+                start: 110,
+                length: 8,
+            },
+        ];
+        let starts = encode_delta_start_payload(&values).unwrap();
+        let (lengths, length_encoding) = encode_length_payload(&values).unwrap();
+        let entry = SpanDirectoryEntry {
+            first_span_id: 0,
+            span_count: values.len() as u32,
+            reference_id: 2,
+            first_start: 100,
+            starts_compressed_offset: 0,
+            starts_compressed_length: starts.len() as u32,
+            starts_uncompressed_length: starts.len() as u32,
+            starts_checksum: checksum(&starts),
+            lengths_compressed_offset: 0,
+            lengths_compressed_length: lengths.len() as u32,
+            lengths_uncompressed_length: lengths.len() as u32,
+            lengths_checksum: checksum(&lengths),
+            start_encoding: START_ENCODING_DELTA,
+            length_encoding,
+            starts_compression: 0,
+            lengths_compression: 0,
+        };
+        assert!(decode_delta_start_payload(&starts, &entry).is_ok());
+
+        let mut truncated = starts.clone();
+        truncated.pop();
+        assert!(decode_delta_start_payload(&truncated, &entry).is_err());
+
+        let mut trailing = starts.clone();
+        trailing.push(0);
+        assert!(decode_delta_start_payload(&trailing, &entry).is_err());
+
+        // One-byte deltas are required to use their minimal LEB128 form.
+        let noncanonical = vec![0x81, 0x00, 0x02, 0x07];
+        assert!(decode_delta_start_payload(&noncanonical, &entry).is_err());
+        assert!(decode_delta_start_payload(&[0x80], &entry).is_err());
+
+        let mut count_mismatch = entry.clone();
+        count_mismatch.span_count = 3;
+        assert!(decode_delta_start_payload(&starts, &count_mismatch).is_err());
+
+        let mut overflowing_start = entry.clone();
+        overflowing_start.first_start = u64::MAX;
+        assert!(decode_delta_start_payload(&starts, &overflowing_start).is_err());
+
+        let mut bad_lengths = lengths.clone();
+        bad_lengths[0..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(decode_length_payload(&bad_lengths, &entry).is_err());
+        assert!(decode_span_rows(&starts, &lengths, &entry).is_ok());
+
+        let single = [SpanKey {
+            reference_id: 2,
+            start: 42,
+            length: 9,
+        }];
+        let single_starts = encode_delta_start_payload(&single).unwrap();
+        assert!(single_starts.is_empty());
+        let (single_lengths, single_encoding) = encode_length_payload(&single).unwrap();
+        let single_entry = SpanDirectoryEntry {
+            first_span_id: 0,
+            span_count: 1,
+            reference_id: 2,
+            first_start: 42,
+            starts_compressed_offset: 0,
+            starts_compressed_length: single_starts.len() as u32,
+            starts_uncompressed_length: single_starts.len() as u32,
+            starts_checksum: checksum(&single_starts),
+            lengths_compressed_offset: 0,
+            lengths_compressed_length: single_lengths.len() as u32,
+            lengths_uncompressed_length: single_lengths.len() as u32,
+            lengths_checksum: checksum(&single_lengths),
+            start_encoding: START_ENCODING_DELTA,
+            length_encoding: single_encoding,
+            starts_compression: 0,
+            lengths_compression: 0,
+        };
+        assert_eq!(
+            decode_span_rows(&single_starts, &single_lengths, &single_entry).unwrap(),
+            vec![Span::from(single[0])]
+        );
+        assert!(decode_delta_start_payload(&[0], &single_entry).is_err());
+    }
+
+    #[test]
     fn test_span_blocks_are_reference_local_and_deterministic() {
         let mut spans = Vec::new();
         for index in 0..5_000_u64 {
@@ -4329,11 +4772,12 @@ mod tests {
                 length: 7,
             });
         }
-        let first = encode_span_blocks(&spans, 1_024).unwrap();
-        let second = encode_span_blocks(&spans, 1_024).unwrap();
+        let first = encode_span_blocks_with_threads(&spans, 1_024, 1).unwrap();
+        let second = encode_span_blocks_with_threads(&spans, 1_024, 1).unwrap();
         assert_eq!(first.0.len(), 6);
         assert_eq!(first.0, second.0);
         assert_eq!(first.1, second.1);
+        assert_eq!(first.2, second.2);
         assert_eq!(
             first
                 .0
@@ -4349,14 +4793,14 @@ mod tests {
         }));
         assert_eq!(first.0[4].reference_id, 0);
         assert_eq!(first.0[5].reference_id, 1);
-        assert!(encode_span_blocks(&spans, 0).is_err());
+        assert!(encode_span_blocks_with_threads(&spans, 0, 1).is_err());
     }
 
     #[test]
     fn test_configured_attributes_and_disjoint_query_spans() {
         let directory = tempdir().expect("should create temp directory");
         let (source, coordinate_index) = write_fixture(directory.path());
-        let destination = directory.path().join("id-only.gni");
+        let destination = directory.path().join("id-only.gai");
         let options = NameIndexOptions::new(["ID"], false).unwrap();
         build_name_index(&source, &coordinate_index, &destination, &options).unwrap();
         let reader = NameIndexReader::open(&destination).unwrap();
@@ -4410,7 +4854,7 @@ mod tests {
             .unwrap();
         index_writer.write_index(&index).unwrap();
         drop(index_writer);
-        let destination = directory.path().join("disjoint.gni");
+        let destination = directory.path().join("disjoint.gai");
         build_name_index(
             &source_path,
             &index_path,
@@ -4439,17 +4883,17 @@ mod tests {
             "overlap",
             &["##gff-version 3", first, first, overlapping],
         );
-        let destination = directory.path().join("overlap.gni");
+        let destination = directory.path().join("overlap.gai");
         build_name_index(
             &source,
             &coordinate_index,
             &destination,
             &NameIndexOptions::new(["Name"], false).unwrap(),
         )
-        .expect("should build overlap GNI");
+        .expect("should build overlap GAI");
 
         let mut indexed = IndexedGff::open(&source, &coordinate_index, &destination)
-            .expect("should open overlap GNI");
+            .expect("should open overlap GAI");
         let (records, stats) = indexed
             .query_name_with_stats("overlap")
             .expect("should query overlap term");
@@ -4534,6 +4978,7 @@ mod tests {
             configured_attributes: &configured_attributes,
             case_sensitive: false,
             normalized_query: "dedup",
+            match_mode: MatchMode::Exact,
         };
         let records = read_query_chunks(&source, &duplicated_chunks, &context, &mut stats).unwrap();
         assert_eq!(records.len(), 2);
@@ -4551,16 +4996,16 @@ mod tests {
             "same-start",
             &["##gff-version 3", longer, shorter],
         );
-        let destination = directory.path().join("same-start.gni");
+        let destination = directory.path().join("same-start.gai");
         build_name_index(
             &source,
             &coordinate_index,
             &destination,
             &NameIndexOptions::new(["Name"], false).unwrap(),
         )
-        .expect("should build same-start GNI");
+        .expect("should build same-start GAI");
         let mut indexed = IndexedGff::open(&source, &coordinate_index, &destination)
-            .expect("should open same-start GNI");
+            .expect("should open same-start GAI");
         let records = indexed.query_name("same-start").unwrap();
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].raw_line, longer);
@@ -4573,7 +5018,7 @@ mod tests {
         let (source, coordinate_index) = write_fixture(directory.path());
         let renamed_index = directory.path().join("coordinates.data");
         fs::copy(&coordinate_index, &renamed_index).expect("should copy coordinate index");
-        let destination = directory.path().join("renamed.gni");
+        let destination = directory.path().join("renamed.gai");
         build_name_index(
             &source,
             &renamed_index,
@@ -4614,7 +5059,7 @@ mod tests {
             .unwrap();
         index_writer.write_index(&index).unwrap();
         drop(index_writer);
-        let non_gff_destination = directory.path().join("non-gff.gni");
+        let non_gff_destination = directory.path().join("non-gff.gai");
         assert!(matches!(
             build_name_index(
                 &non_gff_source,
@@ -4630,7 +5075,7 @@ mod tests {
     fn test_attribute_and_data_section_item_counts_are_validated() {
         let directory = tempdir().expect("should create temp directory");
         let (source, coordinate_index) = write_fixture(directory.path());
-        let destination = directory.path().join("counts.gni");
+        let destination = directory.path().join("counts.gai");
         build_name_index(
             &source,
             &coordinate_index,
@@ -4649,7 +5094,7 @@ mod tests {
             Err(Error::Corrupt(message)) if message.contains("attribute")
         ));
 
-        let two_attribute_destination = directory.path().join("two-attributes.gni");
+        let two_attribute_destination = directory.path().join("two-attributes.gai");
         build_name_index(
             &source,
             &coordinate_index,
@@ -4692,10 +5137,14 @@ mod tests {
         ));
 
         let mut bad_spans_items = original;
-        mutate_section_directory_item_count(&mut bad_spans_items, SectionKind::SpansData, u64::MAX);
+        mutate_section_directory_item_count(
+            &mut bad_spans_items,
+            SectionKind::StartsData,
+            u64::MAX,
+        );
         assert!(matches!(
             NameIndexReader::from_bytes(bad_spans_items),
-            Err(Error::Corrupt(message)) if message.contains("SpansData")
+            Err(Error::Corrupt(message)) if message.contains("StartsData")
         ));
     }
 
@@ -4735,16 +5184,16 @@ mod tests {
         index_writer.write_index(&index).unwrap();
         drop(index_writer);
 
-        let destination = directory.path().join("large.gni");
+        let destination = directory.path().join("large.gai");
         build_name_index(
             &source,
             &coordinate_index,
             &destination,
             &NameIndexOptions::new(["Name"], false).unwrap(),
         )
-        .expect("should build large-feature GNI");
+        .expect("should build large-feature GAI");
         let mut indexed = IndexedGff::open(&source, &coordinate_index, &destination)
-            .expect("should open large-feature GNI");
+            .expect("should open large-feature GAI");
         let records = indexed.query_name("large").unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].start, 100);
@@ -4760,8 +5209,8 @@ mod tests {
         let directory = tempdir().expect("should create temp directory");
         let (source, coordinate_index) = write_fixture(directory.path());
         let options = NameIndexOptions::new(["Name", "Alias", "gene_name"], false).unwrap();
-        let first_destination = directory.path().join("deterministic-first.gni");
-        let second_destination = directory.path().join("deterministic-second.gni");
+        let first_destination = directory.path().join("deterministic-first.gai");
+        let second_destination = directory.path().join("deterministic-second.gai");
         let first_options = BuildOptions::default()
             .with_memory_budget(1)
             .with_compression_threads(1)
@@ -4820,7 +5269,7 @@ mod tests {
         let directory = tempdir().expect("should create temp directory");
         let source = directory.path().join("fasta.gff3.gz");
         let coordinate_index = directory.path().join("fasta.gff3.gz.tbi");
-        let destination = directory.path().join("fasta.gni");
+        let destination = directory.path().join("fasta.gai");
         let record = "chr1\tsrc\tgene\t10\t20\t.\t+\t.\tName=fasta-term";
 
         let write_source = |sequence: &str| {
@@ -4913,7 +5362,7 @@ mod tests {
         }
         let lines = storage.iter().map(String::as_str).collect::<Vec<_>>();
         let (source, coordinate_index) = write_tbi_lines(directory.path(), "progress", &lines);
-        let destination = directory.path().join("progress.gni");
+        let destination = directory.path().join("progress.gai");
         let progress = Arc::new(Mutex::new(Vec::<BuildProgress>::new()));
         let progress_for_callback = Arc::clone(&progress);
         let options = BuildOptions::default()
@@ -4969,8 +5418,8 @@ mod tests {
         lines.extend(storage.iter().map(String::as_str));
         let (source, coordinate_index) = write_tbi_lines(directory.path(), "fan-in", &lines);
         let options = NameIndexOptions::new(["Name"], false).unwrap();
-        let compacted = directory.path().join("compacted.gni");
-        let baseline = directory.path().join("fan-in-baseline.gni");
+        let compacted = directory.path().join("compacted.gai");
+        let baseline = directory.path().join("fan-in-baseline.gai");
         build_name_index_with_options(
             &source,
             &coordinate_index,
@@ -4999,7 +5448,7 @@ mod tests {
         let source = directory.path().join("plain.gff3");
         let text = fixture_records().join("\n") + "\n";
         fs::write(&source, text).unwrap();
-        let destination = directory.path().join("plain.gni");
+        let destination = directory.path().join("plain.gai");
         let stats = build_name_index_with_options(
             &source,
             &coordinate_index,
@@ -5017,7 +5466,7 @@ mod tests {
     fn test_valid_empty_index_has_no_terms_or_spans() {
         let directory = tempdir().unwrap();
         let (source, coordinate_index) = write_fixture(directory.path());
-        let destination = directory.path().join("empty.gni");
+        let destination = directory.path().join("empty.gai");
         let options = NameIndexOptions::new(["not_present"], false).unwrap();
         let stats = build_name_index(&source, &coordinate_index, &destination, &options).unwrap();
         assert_eq!(stats.distinct_terms, 0);
@@ -5035,7 +5484,7 @@ mod tests {
     fn test_csi_build_query_and_index_fingerprints() {
         let directory = tempdir().expect("should create temp directory");
         let (source, coordinate_index) = write_csi_fixture(directory.path());
-        let destination = directory.path().join("fixture-csi.gni");
+        let destination = directory.path().join("fixture-csi.gai");
         build_name_index(
             &source,
             &coordinate_index,
@@ -5062,7 +5511,7 @@ mod tests {
     fn test_corruption_classes_are_rejected_or_bounded() {
         let directory = tempdir().unwrap();
         let (source, coordinate_index) = write_fixture(directory.path());
-        let destination = directory.path().join("corruptions.gni");
+        let destination = directory.path().join("corruptions.gai");
         build_name_index(
             &source,
             &coordinate_index,
@@ -5137,11 +5586,21 @@ mod tests {
         let size_reader = NameIndexReader::from_bytes(bad_decompressed_size).unwrap();
         assert!(size_reader.lookup_span_ids("brca1").is_err());
 
+        for component in [SectionKind::StartsData, SectionKind::LengthsData] {
+            let mut damaged_component = original.clone();
+            mutate_section(&mut damaged_component, component, |section| {
+                assert!(!section.is_empty());
+                section[0] ^= 0xff;
+            });
+            let component_reader = NameIndexReader::from_bytes(damaged_component).unwrap();
+            assert!(component_reader.resolve_span_id(0).is_err());
+        }
+
         let mut bad_span_ref = original.clone();
         mutate_section(&mut bad_span_ref, SectionKind::SpansDirectory, |section| {
             section[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
         });
-        let bad_span_destination = directory.path().join("bad-span-ref.gni");
+        let bad_span_destination = directory.path().join("bad-span-ref.gai");
         fs::write(&bad_span_destination, &bad_span_ref).unwrap();
         assert!(matches!(
             IndexedGff::open(&source, &coordinate_index, &bad_span_destination),
@@ -5150,7 +5609,7 @@ mod tests {
 
         let mut bad_reference_count = original.clone();
         bad_reference_count[200..204].copy_from_slice(&3_u32.to_le_bytes());
-        let bad_reference_count_destination = directory.path().join("bad-reference-count.gni");
+        let bad_reference_count_destination = directory.path().join("bad-reference-count.gai");
         fs::write(&bad_reference_count_destination, &bad_reference_count).unwrap();
         assert!(matches!(
             IndexedGff::open(&source, &coordinate_index, &bad_reference_count_destination),
@@ -5178,7 +5637,7 @@ mod tests {
 
         let bad_source = directory.path().join("bad.gff3");
         fs::write(&bad_source, b"not a GFF record\n").unwrap();
-        let atomic_destination = directory.path().join("atomic.gni");
+        let atomic_destination = directory.path().join("atomic.gai");
         fs::write(&atomic_destination, b"previous valid output").unwrap();
         assert!(
             build_name_index(

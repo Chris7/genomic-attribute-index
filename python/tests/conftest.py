@@ -10,7 +10,7 @@ import pytest
 def fixture_paths(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Path]:
     """Create a deterministic BGZF source and matching TBI/CSI indexes."""
     root = Path(__file__).resolve().parents[2]
-    directory = tmp_path_factory.mktemp("gni-fixture")
+    directory = tmp_path_factory.mktemp("gai-fixture")
     subprocess.run(
         [
             "cargo",

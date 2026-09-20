@@ -52,8 +52,8 @@ fn write_fixture(directory: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
 fn cli_index_query_and_inspect() {
     let directory = tempdir().expect("should create temp directory");
     let (source, coordinate_index) = write_fixture(directory.path());
-    let destination = directory.path().join("cli.gni");
-    let binary = env!("CARGO_BIN_EXE_gni");
+    let destination = directory.path().join("cli.gai");
+    let binary = env!("CARGO_BIN_EXE_gai");
     let source = source.to_string_lossy().into_owned();
     let coordinate_index = coordinate_index.to_string_lossy().into_owned();
     let destination_string = destination.to_string_lossy().into_owned();
@@ -70,7 +70,7 @@ fn cli_index_query_and_inspect() {
             &destination_string,
         ])
         .output()
-        .expect("should run gni build-index");
+        .expect("should run gai build-index");
     assert!(indexed.status.success(), "stderr: {:?}", indexed.stderr);
     assert!(destination.exists());
     assert!(String::from_utf8_lossy(&indexed.stdout).contains("wrote"));
@@ -85,27 +85,65 @@ fn cli_index_query_and_inspect() {
             "BRCA1",
             "--coordinate-index",
             &coordinate_index,
-            "--gni",
+            "--gai",
             &destination_string,
         ])
         .output()
-        .expect("should run gni query-index");
+        .expect("should run gai query-index");
     assert!(queried.status.success(), "stderr: {:?}", queried.stderr);
     assert_eq!(
         String::from_utf8_lossy(&queried.stdout).trim(),
         "chr1\tsrc\tgene\t10\t20\t.\t+\t.\tName=BRCA1;Alias=BRCC1"
     );
 
+    let prefix = Command::new(binary)
+        .args([
+            "query-index",
+            &source,
+            "BRCA",
+            "--match",
+            "prefix",
+            "--coordinate-index",
+            &coordinate_index,
+            "--gai",
+            &destination_string,
+        ])
+        .output()
+        .expect("should run prefix query");
+    assert!(prefix.status.success(), "stderr: {:?}", prefix.stderr);
+    assert_eq!(
+        String::from_utf8_lossy(&prefix.stdout).trim(),
+        "chr1\tsrc\tgene\t10\t20\t.\t+\t.\tName=BRCA1;Alias=BRCC1"
+    );
+
+    let invalid_match = Command::new(binary)
+        .args([
+            "query-index",
+            &source,
+            "BRCA",
+            "--match",
+            "substring",
+            "--coordinate-index",
+            &coordinate_index,
+            "--gai",
+            &destination_string,
+        ])
+        .output()
+        .expect("should reject invalid match mode");
+    assert!(!invalid_match.status.success());
+    assert!(String::from_utf8_lossy(&invalid_match.stderr).contains("exact"));
+
     let inspected = Command::new(binary)
         .args(["inspect-index", &destination_string])
         .output()
-        .expect("should run gni inspect-index");
+        .expect("should run gai inspect-index");
     assert!(inspected.status.success(), "stderr: {:?}", inspected.stderr);
     let inspection = String::from_utf8_lossy(&inspected.stdout);
     assert!(inspection.contains("zero-based half-open"));
     assert!(inspection.contains("FST bytes:"));
     assert!(inspection.contains("postings compression"));
-    assert!(inspection.contains("span compression"));
+    assert!(inspection.contains("starts compression"));
+    assert!(inspection.contains("lengths compression"));
 
     let missing_attribute = Command::new(binary)
         .args([
@@ -122,9 +160,10 @@ fn cli_index_query_and_inspect() {
     let help = Command::new(binary)
         .arg("--help")
         .output()
-        .expect("should run gni help");
+        .expect("should run gai help");
     assert!(help.status.success());
     let help = String::from_utf8_lossy(&help.stdout);
+    assert!(help.contains("Usage: gai"));
     assert!(help.contains("build-index"));
     assert!(help.contains("query-index"));
     assert!(help.contains("inspect-index"));

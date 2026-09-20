@@ -1,10 +1,12 @@
 use std::{path::PathBuf, process::ExitCode};
 
-use clap::{Args, Parser, Subcommand};
-use gni::{BuildOptions, IndexedGff, NameIndexOptions, Result, build_name_index_with_options};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use gai::{
+    BuildOptions, IndexedGff, MatchMode, NameIndexOptions, Result, build_name_index_with_options,
+};
 
 #[derive(Debug, Parser)]
-#[command(name = "gni", about = "GFF3 indexing and exact attribute-name queries")]
+#[command(name = "gai", about = "GFF3 indexing and attribute-name queries")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -12,13 +14,13 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Build a deterministic GFF Name Index (GNI).
+    /// Build a deterministic Genomic Attribute Index (GAI) for configured GFF3 attributes.
     #[command(name = "build-index")]
     Build(BuildIndexArgs),
     /// Query configured attribute values through TBI/CSI and print GFF3 records.
     #[command(name = "query-index")]
     Query(QueryIndexArgs),
-    /// Display GNI format, normalization, fingerprint, and block metadata.
+    /// Display GAI format, normalization, fingerprint, and block metadata.
     #[command(name = "inspect-index")]
     Inspect(InspectArgs),
 }
@@ -33,7 +35,7 @@ struct BuildIndexArgs {
     /// Explicit TBI or CSI path. If omitted, discover an unambiguous sibling.
     #[arg(long = "coordinate-index")]
     coordinate_index: Option<PathBuf>,
-    /// Destination GNI path. Defaults to <input>.gni.
+    /// Destination GAI path. Defaults to <input>.gai.
     #[arg(long)]
     output: Option<PathBuf>,
     /// Preserve case after trimming values.
@@ -59,14 +61,32 @@ struct QueryIndexArgs {
     /// Explicit TBI or CSI path. If omitted, discover an unambiguous sibling.
     #[arg(long = "coordinate-index")]
     coordinate_index: Option<PathBuf>,
-    /// Explicit GNI path. Defaults to <input>.gni.
+    /// Explicit GAI path. Defaults to <input>.gai.
     #[arg(long)]
-    gni: Option<PathBuf>,
+    gai: Option<PathBuf>,
+    /// Match complete values exactly or stream values beginning with the query.
+    #[arg(long = "match", value_enum, default_value_t = QueryMatch::Exact)]
+    match_mode: QueryMatch,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum QueryMatch {
+    Exact,
+    Prefix,
+}
+
+impl From<QueryMatch> for MatchMode {
+    fn from(value: QueryMatch) -> Self {
+        match value {
+            QueryMatch::Exact => Self::Exact,
+            QueryMatch::Prefix => Self::Prefix,
+        }
+    }
 }
 
 #[derive(Debug, Args)]
 struct InspectArgs {
-    /// GNI path.
+    /// GAI path.
     input: PathBuf,
 }
 
@@ -76,12 +96,12 @@ fn discover_coordinate_index(input: &std::path::Path) -> Result<PathBuf> {
     match (tbi.exists(), csi.exists()) {
         (true, false) => Ok(tbi),
         (false, true) => Ok(csi),
-        (true, true) => Err(gni::Error::InvalidInput(format!(
+        (true, true) => Err(gai::Error::InvalidInput(format!(
             "both {} and {} exist; pass --coordinate-index explicitly",
             tbi.display(),
             csi.display()
         ))),
-        (false, false) => Err(gni::Error::InvalidInput(format!(
+        (false, false) => Err(gai::Error::InvalidInput(format!(
             "could not discover {}.tbi or {}.csi",
             input.display(),
             input.display()
@@ -97,13 +117,13 @@ fn run(cli: Cli) -> Result<()> {
                 .unwrap_or(discover_coordinate_index(&arguments.input)?);
             let output = arguments
                 .output
-                .unwrap_or_else(|| PathBuf::from(format!("{}.gni", arguments.input.display())));
+                .unwrap_or_else(|| PathBuf::from(format!("{}.gai", arguments.input.display())));
             let options = NameIndexOptions::new(arguments.attributes, arguments.case_sensitive)?;
             let mut build_options = BuildOptions::default()
                 .with_memory_budget(arguments.memory_budget)
                 .with_progress(|progress| {
                     eprintln!(
-                        "gni: {:?}: records={} bytes={} elapsed={:.1}s",
+                        "gai: {:?}: records={} bytes={} elapsed={:.1}s",
                         progress.phase,
                         progress.records_processed,
                         progress.bytes_read,
@@ -131,7 +151,7 @@ fn run(cli: Cli) -> Result<()> {
             println!("postings: {}", stats.postings);
             println!("index bytes: {}", stats.index_bytes);
             eprintln!(
-                "gni: complete: {:.0} records/s; phases scan={:.3}s spill={:.3}s merge={:.3}s postings={:.3}s spans={:.3}s serialize={:.3}s total={:.3}s; peak working set={} bytes",
+                "gai: complete: {:.0} records/s; phases scan={:.3}s spill={:.3}s merge={:.3}s postings={:.3}s spans={:.3}s serialize={:.3}s total={:.3}s; peak working set={} bytes",
                 stats.records_processed as f64
                     / stats.timings.total.as_secs_f64().max(f64::MIN_POSITIVE),
                 stats.timings.scan.as_secs_f64(),
@@ -148,18 +168,20 @@ fn run(cli: Cli) -> Result<()> {
             let coordinate_index = arguments
                 .coordinate_index
                 .unwrap_or(discover_coordinate_index(&arguments.input)?);
-            let gni = arguments
-                .gni
-                .unwrap_or_else(|| PathBuf::from(format!("{}.gni", arguments.input.display())));
-            let mut indexed = IndexedGff::open(&arguments.input, coordinate_index, gni)?;
-            for record in indexed.query_name(&arguments.term)? {
+            let gai = arguments
+                .gai
+                .unwrap_or_else(|| PathBuf::from(format!("{}.gai", arguments.input.display())));
+            let mut indexed = IndexedGff::open(&arguments.input, coordinate_index, gai)?;
+            for record in
+                indexed.query_name_with_mode(&arguments.term, arguments.match_mode.into())?
+            {
                 println!("{}", record.raw_line);
             }
         }
         Command::Inspect(arguments) => {
-            let metadata = gni::NameIndexReader::open(arguments.input)?.inspect();
+            let metadata = gai::NameIndexReader::open(arguments.input)?.inspect();
             println!(
-                "GNI version: {}.{}",
+                "GAI version: {}.{}",
                 metadata.major_version, metadata.minor_version
             );
             println!("coordinate convention: zero-based half-open start + length");
@@ -180,9 +202,8 @@ fn run(cli: Cli) -> Result<()> {
             println!("span blocks: {}", metadata.span_block_count);
             println!("span block target: {}", metadata.span_block_size);
             println!(
-                "span encodings (delta/FOR starts, varint/FOR lengths): {}/{}, {}/{}",
+                "span encodings (delta-varint starts, varint/FOR lengths): {}, {}/{}",
                 metadata.delta_start_blocks,
-                metadata.for_start_blocks,
                 metadata.varint_length_blocks,
                 metadata.for_length_blocks
             );
@@ -205,18 +226,34 @@ fn run(cli: Cli) -> Result<()> {
                 )
             );
             println!(
-                "span directory/data bytes: {}/{}",
-                metadata.span_directory_bytes, metadata.span_data_bytes
+                "span directory/starts/lengths bytes: {}/{}/{}",
+                metadata.span_directory_bytes,
+                metadata.starts_data_bytes,
+                metadata.lengths_data_bytes
             );
             println!(
-                "span compression (uncompressed/compressed): {}/{} bytes ({:.2}x)",
-                metadata.span_uncompressed_bytes,
-                metadata.span_data_bytes,
-                compression_ratio(metadata.span_uncompressed_bytes, metadata.span_data_bytes)
+                "starts compression (uncompressed/compressed): {}/{} bytes ({:.2}x)",
+                metadata.starts_uncompressed_bytes,
+                metadata.starts_data_bytes,
+                compression_ratio(
+                    metadata.starts_uncompressed_bytes,
+                    metadata.starts_data_bytes
+                )
             );
             println!(
-                "zstd blocks (postings/spans): {}/{}",
-                metadata.compressed_postings_blocks, metadata.compressed_span_blocks
+                "lengths compression (uncompressed/compressed): {}/{} bytes ({:.2}x)",
+                metadata.lengths_uncompressed_bytes,
+                metadata.lengths_data_bytes,
+                compression_ratio(
+                    metadata.lengths_uncompressed_bytes,
+                    metadata.lengths_data_bytes
+                )
+            );
+            println!(
+                "zstd blocks (postings/starts/lengths): {}/{}/{}",
+                metadata.compressed_postings_blocks,
+                metadata.compressed_start_blocks,
+                metadata.compressed_length_blocks
             );
             println!("file bytes: {}", metadata.file_size);
             println!("GFF SHA-256: {}", hex(&metadata.gff_fingerprint));
@@ -249,7 +286,7 @@ fn main() -> ExitCode {
     match run(Cli::parse()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("gni: {error}");
+            eprintln!("gai: {error}");
             ExitCode::from(1)
         }
     }

@@ -2,7 +2,7 @@
 name = "genomic-attribute-index"
 version = "0.1.0"
 edition = "2024"
-description = "Deterministic GFF Name Index (GNI) builder and indexed query library"
+description = "Deterministic Genomic Attribute Index (GAI) builder and indexed query library"
 license = "Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/Chris7/genomic-attribute-index"
@@ -21,11 +21,11 @@ include = [
 ]
 
 [lib]
-name = "gni"
+name = "gai"
 path = "src/lib.rs"
 
 [[bin]]
-name = "gni"
+name = "gai"
 path = "src/main.rs"
 
 [dependencies]

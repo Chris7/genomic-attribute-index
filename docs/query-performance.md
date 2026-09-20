@@ -1,7 +1,7 @@
-# GNI indexed-query performance
+# GAI indexed-query performance
 
 `benches/query-performance.rs` measures a real indexed lookup against the
-checked-in `fixtures/gencode_sorted.gff.gz`, its `.tbi`, and its `.gni`. It
+checked-in `fixtures/gencode_sorted.gff.gz`, its `.tbi`, and its `.gai`. It
 does not modify the fixture. The benchmark is a custom ignored target, so it
 is not run by ordinary tests:
 
@@ -12,13 +12,13 @@ cargo bench --bench query-performance --all-features
 The measurement below was captured on x86-64 Linux with Rust 1.98,
 noodles-bgzf 0.43.0, and the release profile in this repository. The fixture
 contains 1,436 matching `gene_name=brca1` records spread across 160 exact
-spans (75 reference/start groups). The open phase includes the GNI mmap and
+spans (75 reference/start groups). The open phase includes the GAI mmap and
 the source, coordinate-index, and reference-dictionary fingerprint checks.
 
 | phase | elapsed | result |
 | --- | ---: | ---: |
-| open and fingerprint | 76.108 ms | reader opened successfully |
-| indexed query | 21.857 ms | 1,436 records, 65,701 records/s |
+| open and fingerprint | 64.382 ms | reader opened successfully |
+| indexed query | 18.294 ms | 1,436 records, 78,496 records/s |
 
 The query instrumentation for that run was:
 

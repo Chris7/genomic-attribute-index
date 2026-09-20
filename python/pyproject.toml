@@ -5,11 +5,11 @@ build-backend = "maturin"
 [project]
 name = "genomic-attribute-index"
 version = "0.1.0"
-description = "Python bindings for the deterministic GFF Name Index"
+description = "Python bindings for the deterministic Genomic Attribute Index"
 readme = "PYPI-README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
-authors = [{ name = "GNI contributors" }]
+authors = [{ name = "GAI contributors" }]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Science/Research",
@@ -23,6 +23,6 @@ classifiers = [
 [tool.maturin]
 manifest-path = "Cargo.toml"
 python-source = "src"
-module-name = "gni._gni"
+module-name = "gai._gai"
 features = ["abi3", "extension-module"]
 compatibility = "pypi"

@@ -5,7 +5,7 @@
 
 use std::{path::Path, time::Instant};
 
-use gni::IndexedGff;
+use gai::IndexedGff;
 
 fn main() {
     if cfg!(debug_assertions) {
@@ -14,9 +14,9 @@ fn main() {
 
     let source = Path::new("fixtures/gencode_sorted.gff.gz");
     let coordinate_index = Path::new("fixtures/gencode_sorted.gff.gz.tbi");
-    let gni = Path::new("fixtures/gencode_sorted.gff.gz.gni");
+    let gai = Path::new("fixtures/gencode_sorted.gff.gz.gai");
 
-    if !(source.exists() && coordinate_index.exists() && gni.exists()) {
+    if !(source.exists() && coordinate_index.exists() && gai.exists()) {
         eprintln!(
             "query-performance: skipping; expected fixture files are absent under {}",
             source.display()
@@ -25,7 +25,7 @@ fn main() {
     }
 
     let open_started = Instant::now();
-    let mut indexed = IndexedGff::open(source, coordinate_index, gni)
+    let mut indexed = IndexedGff::open(source, coordinate_index, gai)
         .expect("should open the real GENCODE fixture");
     let open_elapsed = open_started.elapsed();
 

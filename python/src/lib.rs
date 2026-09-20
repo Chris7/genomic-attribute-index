@@ -1,8 +1,8 @@
 use std::{path::PathBuf, sync::Mutex};
 
-use gni::{
-    BuildOptions, Error, GffRecord, IndexMetadata, IndexStats, IndexedGff, NameIndexOptions,
-    QueryStats, build_name_index_with_options,
+use gai::{
+    BuildOptions, Error, GffRecord, IndexMetadata, IndexStats, IndexedGff, MatchMode,
+    NameIndexOptions, QueryStats, build_name_index_with_options,
 };
 use pyo3::{
     Bound, PyResult, Python, create_exception, exceptions::PyException, prelude::PyModule, pyclass,
@@ -10,34 +10,34 @@ use pyo3::{
 };
 
 create_exception!(
-    _gni,
-    GniError,
+    _gai,
+    GaiError,
     PyException,
-    "Base error raised by the GNI bindings."
+    "Base error raised by the GAI bindings."
 );
 create_exception!(
-    _gni,
-    GniInputError,
-    GniError,
-    "Invalid GNI input or API argument."
+    _gai,
+    GaiInputError,
+    GaiError,
+    "Invalid GAI input or API argument."
 );
-create_exception!(_gni, GniIoError, GniError, "GNI input/output failure.");
-create_exception!(_gni, GniCorruptError, GniError, "Corrupt GNI data.");
+create_exception!(_gai, GaiIoError, GaiError, "GAI input/output failure.");
+create_exception!(_gai, GaiCorruptError, GaiError, "Corrupt GAI data.");
 create_exception!(
-    _gni,
-    GniStaleError,
-    GniError,
-    "GNI/source/index fingerprints do not match."
+    _gai,
+    GaiStaleError,
+    GaiError,
+    "GAI/source/index fingerprints do not match."
 );
 
 fn to_py_error(error: Error) -> pyo3::PyErr {
     match error {
-        Error::Io(error) => GniIoError::new_err(error.to_string()),
-        Error::InvalidInput(message) => GniInputError::new_err(message),
-        Error::InvalidCoordinate => GniInputError::new_err("invalid coordinate"),
-        Error::Corrupt(message) => GniCorruptError::new_err(message),
-        Error::Stale(message) => GniStaleError::new_err(message),
-        Error::Compression(message) => GniError::new_err(format!("compression error: {message}")),
+        Error::Io(error) => GaiIoError::new_err(error.to_string()),
+        Error::InvalidInput(message) => GaiInputError::new_err(message),
+        Error::InvalidCoordinate => GaiInputError::new_err("invalid coordinate"),
+        Error::Corrupt(message) => GaiCorruptError::new_err(message),
+        Error::Stale(message) => GaiStaleError::new_err(message),
+        Error::Compression(message) => GaiError::new_err(format!("compression error: {message}")),
     }
 }
 
@@ -153,19 +153,25 @@ struct PyIndexMetadata {
     #[pyo3(get)]
     span_uncompressed_bytes: u64,
     #[pyo3(get)]
-    span_data_bytes: u64,
+    starts_data_bytes: u64,
+    #[pyo3(get)]
+    lengths_data_bytes: u64,
+    #[pyo3(get)]
+    starts_uncompressed_bytes: u64,
+    #[pyo3(get)]
+    lengths_uncompressed_bytes: u64,
     #[pyo3(get)]
     compressed_postings_blocks: u64,
     #[pyo3(get)]
-    compressed_span_blocks: u64,
-    #[pyo3(get)]
     delta_start_blocks: u64,
-    #[pyo3(get)]
-    for_start_blocks: u64,
     #[pyo3(get)]
     varint_length_blocks: u64,
     #[pyo3(get)]
     for_length_blocks: u64,
+    #[pyo3(get)]
+    compressed_start_blocks: u64,
+    #[pyo3(get)]
+    compressed_length_blocks: u64,
 }
 
 impl From<IndexMetadata> for PyIndexMetadata {
@@ -193,13 +199,16 @@ impl From<IndexMetadata> for PyIndexMetadata {
             postings_data_bytes: metadata.postings_data_bytes,
             span_directory_bytes: metadata.span_directory_bytes,
             span_uncompressed_bytes: metadata.span_uncompressed_bytes,
-            span_data_bytes: metadata.span_data_bytes,
+            starts_data_bytes: metadata.starts_data_bytes,
+            lengths_data_bytes: metadata.lengths_data_bytes,
+            starts_uncompressed_bytes: metadata.starts_uncompressed_bytes,
+            lengths_uncompressed_bytes: metadata.lengths_uncompressed_bytes,
             compressed_postings_blocks: metadata.compressed_postings_blocks,
-            compressed_span_blocks: metadata.compressed_span_blocks,
             delta_start_blocks: metadata.delta_start_blocks,
-            for_start_blocks: metadata.for_start_blocks,
             varint_length_blocks: metadata.varint_length_blocks,
             for_length_blocks: metadata.for_length_blocks,
+            compressed_start_blocks: metadata.compressed_start_blocks,
+            compressed_length_blocks: metadata.compressed_length_blocks,
         }
     }
 }
@@ -233,6 +242,20 @@ struct PyBuildStats {
     span_bytes_structural: u64,
     #[pyo3(get)]
     span_bytes_after_compression: u64,
+    #[pyo3(get)]
+    span_starts_bytes_before_compression: u64,
+    #[pyo3(get)]
+    span_starts_bytes_after_compression: u64,
+    #[pyo3(get)]
+    span_lengths_bytes_before_compression: u64,
+    #[pyo3(get)]
+    span_lengths_bytes_after_compression: u64,
+    #[pyo3(get)]
+    delta_start_blocks: u64,
+    #[pyo3(get)]
+    length_varint_blocks: u64,
+    #[pyo3(get)]
+    length_for_blocks: u64,
     #[pyo3(get)]
     bytes_per_term: f64,
     #[pyo3(get)]
@@ -273,6 +296,13 @@ impl From<IndexStats> for PyBuildStats {
             span_bytes_fixed_width: stats.span_bytes_fixed_width,
             span_bytes_structural: stats.span_bytes_structural,
             span_bytes_after_compression: stats.span_bytes_after_compression,
+            span_starts_bytes_before_compression: stats.span_starts_bytes_before_compression,
+            span_starts_bytes_after_compression: stats.span_starts_bytes_after_compression,
+            span_lengths_bytes_before_compression: stats.span_lengths_bytes_before_compression,
+            span_lengths_bytes_after_compression: stats.span_lengths_bytes_after_compression,
+            delta_start_blocks: stats.delta_start_blocks,
+            length_varint_blocks: stats.length_varint_blocks,
+            length_for_blocks: stats.length_for_blocks,
             bytes_per_term: stats.bytes_per_term,
             bytes_per_posting: stats.bytes_per_posting,
             bytes_per_unique_span: stats.bytes_per_unique_span,
@@ -336,48 +366,57 @@ fn records(records: Vec<GffRecord>) -> Vec<PyGffRecord> {
 fn open_inner(
     input: PathBuf,
     coordinate_index: PathBuf,
-    gni: PathBuf,
+    gai: PathBuf,
 ) -> Result<IndexedGff, Error> {
-    IndexedGff::open(input, coordinate_index, gni)
+    IndexedGff::open(input, coordinate_index, gai)
+}
+
+fn parse_match_mode(value: &str) -> Result<MatchMode, Error> {
+    MatchMode::parse(value)
 }
 
 #[pymethods]
 impl PyIndexedGff {
-    /// Return metadata after the source/index/GNI fingerprints were checked.
+    /// Return metadata after the source/index/GAI fingerprints were checked.
     fn metadata(&self) -> PyResult<PyIndexMetadata> {
         let guard = self
             .inner
             .lock()
-            .map_err(|_| GniError::new_err("indexed reader lock is poisoned"))?;
+            .map_err(|_| GaiError::new_err("indexed reader lock is poisoned"))?;
         Ok(guard.metadata().clone().into())
     }
 
     /// Query one normalized configured attribute value.
-    fn query(&self, py: Python<'_>, term: &str) -> PyResult<Vec<PyGffRecord>> {
+    #[pyo3(signature = (term, *, r#match = "exact"))]
+    fn query(&self, py: Python<'_>, term: &str, r#match: &str) -> PyResult<Vec<PyGffRecord>> {
         let term = term.to_owned();
+        let match_mode = parse_match_mode(r#match).map_err(to_py_error)?;
         let result = py.allow_threads(|| {
             let mut guard = self
                 .inner
                 .lock()
                 .map_err(|_| Error::InvalidInput("indexed reader lock is poisoned".into()))?;
-            guard.query_name(&term)
+            guard.query_name_with_mode(&term, match_mode)
         });
         result.map(records).map_err(to_py_error)
     }
 
     /// Query and return bounded I/O/candidate instrumentation.
+    #[pyo3(signature = (term, *, r#match = "exact"))]
     fn query_with_stats(
         &self,
         py: Python<'_>,
         term: &str,
+        r#match: &str,
     ) -> PyResult<(Vec<PyGffRecord>, PyQueryStats)> {
         let term = term.to_owned();
+        let match_mode = parse_match_mode(r#match).map_err(to_py_error)?;
         let result = py.allow_threads(|| {
             let mut guard = self
                 .inner
                 .lock()
                 .map_err(|_| Error::InvalidInput("indexed reader lock is poisoned".into()))?;
-            guard.query_name_with_stats(&term)
+            guard.query_name_with_mode_and_stats(&term, match_mode)
         });
         result
             .map(|(values, stats)| (records(values), stats.into()))
@@ -423,9 +462,9 @@ fn open_index(
     py: Python<'_>,
     input: PathBuf,
     coordinate_index: PathBuf,
-    gni: PathBuf,
+    gai: PathBuf,
 ) -> PyResult<PyIndexedGff> {
-    py.allow_threads(|| open_inner(input, coordinate_index, gni))
+    py.allow_threads(|| open_inner(input, coordinate_index, gai))
         .map(|inner| PyIndexedGff {
             inner: Mutex::new(inner),
         })
@@ -433,35 +472,38 @@ fn open_index(
 }
 
 #[pyfunction]
+#[pyo3(signature = (input, coordinate_index, gai, term, *, r#match = "exact"))]
 fn query_index(
     py: Python<'_>,
     input: PathBuf,
     coordinate_index: PathBuf,
-    gni: PathBuf,
+    gai: PathBuf,
     term: String,
+    r#match: &str,
 ) -> PyResult<Vec<PyGffRecord>> {
+    let match_mode = parse_match_mode(r#match).map_err(to_py_error)?;
     py.allow_threads(|| {
-        let mut indexed = open_inner(input, coordinate_index, gni)?;
-        indexed.query_name(&term)
+        let mut indexed = open_inner(input, coordinate_index, gai)?;
+        indexed.query_name_with_mode(&term, match_mode)
     })
     .map(records)
     .map_err(to_py_error)
 }
 
 #[pyfunction]
-fn inspect_index(py: Python<'_>, gni: PathBuf) -> PyResult<PyIndexMetadata> {
-    py.allow_threads(|| gni::NameIndexReader::open(gni).map(|reader| reader.inspect()))
+fn inspect_index(py: Python<'_>, gai: PathBuf) -> PyResult<PyIndexMetadata> {
+    py.allow_threads(|| gai::NameIndexReader::open(gai).map(|reader| reader.inspect()))
         .map(Into::into)
         .map_err(to_py_error)
 }
 
 #[pymodule]
-fn _gni(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add("GniError", m.py().get_type::<GniError>())?;
-    m.add("GniInputError", m.py().get_type::<GniInputError>())?;
-    m.add("GniIoError", m.py().get_type::<GniIoError>())?;
-    m.add("GniCorruptError", m.py().get_type::<GniCorruptError>())?;
-    m.add("GniStaleError", m.py().get_type::<GniStaleError>())?;
+fn _gai(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add("GaiError", m.py().get_type::<GaiError>())?;
+    m.add("GaiInputError", m.py().get_type::<GaiInputError>())?;
+    m.add("GaiIoError", m.py().get_type::<GaiIoError>())?;
+    m.add("GaiCorruptError", m.py().get_type::<GaiCorruptError>())?;
+    m.add("GaiStaleError", m.py().get_type::<GaiStaleError>())?;
     m.add_class::<PyGffRecord>()?;
     m.add_class::<PyIndexMetadata>()?;
     m.add_class::<PyBuildStats>()?;

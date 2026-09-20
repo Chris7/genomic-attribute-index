@@ -31,8 +31,8 @@ RUN touch src/lib.rs src/main.rs \
     && cargo build --release --locked \
     && cargo test --locked --all-targets --all-features
 
-RUN useradd --create-home --shell /bin/bash gni \
-    && chown -R gni:gni /app
-USER gni
+RUN useradd --create-home --shell /bin/bash gai \
+    && chown -R gai:gai /app
+USER gai
 
 CMD ["bash"]

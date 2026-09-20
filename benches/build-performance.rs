@@ -7,7 +7,7 @@
 
 use std::{fs::File, io::Write, time::Instant};
 
-use gni::{BuildOptions, NameIndexOptions, build_name_index_with_options};
+use gai::{BuildOptions, NameIndexOptions, build_name_index_with_options};
 use noodles::{
     bgzf,
     core::Position,
@@ -71,8 +71,8 @@ fn main() {
 
     let options = NameIndexOptions::new(["Name", "Alias"], false)
         .expect("should configure benchmark attributes");
-    let baseline_path = directory.path().join("baseline.gni");
-    let bounded_path = directory.path().join("bounded.gni");
+    let baseline_path = directory.path().join("baseline.gai");
+    let bounded_path = directory.path().join("bounded.gai");
     let baseline_options = BuildOptions::default()
         .with_memory_budget(1 << 30)
         .with_compression_threads(4)
@@ -90,7 +90,7 @@ fn main() {
         &options,
         &baseline_options,
     )
-    .expect("should build baseline GNI");
+    .expect("should build baseline GAI");
     let baseline_elapsed = baseline_started.elapsed();
 
     let bounded_started = Instant::now();
@@ -101,7 +101,7 @@ fn main() {
         &options,
         &bounded_options,
     )
-    .expect("should build bounded GNI");
+    .expect("should build bounded GAI");
     let bounded_elapsed = bounded_started.elapsed();
 
     println!("fixture records: {RECORD_COUNT}");

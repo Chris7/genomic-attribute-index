@@ -24,7 +24,7 @@ jobs:
         with:
           context: .
           file: Dockerfile
-          tags: gni:rust-dev
+          tags: gai:rust-dev
           push: false
           load: false
       - name: Build Python development image
@@ -32,8 +32,8 @@ jobs:
         with:
           context: .
           file: python/Dockerfile
-          tags: gni:python-dev
+          tags: gai:python-dev
           push: false
           load: true
       - name: Run Python tests in development image
-        run: docker run --rm gni:python-dev
+        run: docker run --rm gai:python-dev
