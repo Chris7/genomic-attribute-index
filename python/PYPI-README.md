@@ -9,6 +9,8 @@ stale or corrupt inputs.
 from pathlib import Path
 import gai
 
+gai.sort(Path("annotations.gff3.gz"), Path("annotations.sorted.gff3"))
+
 source = Path("annotations.gff3.gz")
 tbi = Path("annotations.gff3.gz.tbi")
 gai.build_index(source, tbi, Path("annotations.gff3.gz.gai"), ["Name"])
