@@ -26,3 +26,4 @@ python-source = "src"
 module-name = "gai._gai"
 features = ["abi3", "extension-module"]
 compatibility = "pypi"
+data = "gai.data"

@@ -122,32 +122,72 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.release.tag_name || inputs.tag || github.ref_name }}
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: nightly-2026-06-26
+
+      - name: Build gai binary
+        run: cargo build --release --locked --bin gai
+
+      - name: Stage gai binary for Python wheel
+        shell: python
+        run: |
+          import os
+          import shutil
+          from pathlib import Path
+
+          executable = "gai.exe" if os.name == "nt" else "gai"
+
+          source = Path("target/release") / executable
+          destination = Path("python/gai.data/scripts") / executable
+
+          if not source.is_file():
+              raise SystemExit(f"missing gai binary: {source}")
+
+          destination.parent.mkdir(parents=True, exist_ok=True)
+          shutil.copy2(source, destination)
+
+          print(f"staged {source} -> {destination}")
+
       - uses: PyO3/maturin-action@86b9d133d34bc1b40018696f782949dac11bd380
         with:
           command: build
           maturin-version: v1.11.5
           args: --manifest-path python/Cargo.toml --release --locked --features abi3,extension-module --compatibility pypi --out dist
+
       - name: Smoke-test wheel
         shell: python
         run: |
+          import shutil
           import subprocess
           import sys
           from pathlib import Path
 
           wheel = next(Path("dist").glob("*.whl"))
           subprocess.check_call([
-              sys.executable, "-m", "pip", "install", "--disable-pip-version-check",
-              "--force-reinstall", str(wheel),
+              sys.executable, "-m", "pip", "install",
+              "--disable-pip-version-check",
+              "--force-reinstall",
+              str(wheel),
           ])
+
           subprocess.check_call([
-              sys.executable, "-c", "import gai; print(gai.__version__)",
+              sys.executable, "-c",
+              "import gai; print(gai.__version__)",
           ])
+
+          gai = shutil.which("gai")
+          if gai is None:
+              raise SystemExit("gai executable was not installed by the wheel")
+
+          print(f"gai executable: {gai}")
+          subprocess.check_call([gai, "--help"])
+
       - uses: actions/upload-artifact@v4
         with:
           name: python-wheels-${{ matrix.os }}
@@ -174,6 +214,7 @@ jobs:
       - name: Install and test wheel
         run: |
           python -m pip install --disable-pip-version-check pytest dist/*.whl
+          gai --help
           pytest -q python/tests
 
   publish-crates:
