@@ -22,6 +22,7 @@ from ._gai import (
     inspect_index as _inspect_index,
     open_index as _open_index,
     query_index as _query_index,
+    sort as _sort,
 )
 
 __all__ = [
@@ -40,6 +41,7 @@ __all__ = [
     "inspect_index",
     "open_index",
     "query_index",
+    "sort",
 ]
 
 MatchMode = Literal["exact", "prefix"]
@@ -49,6 +51,15 @@ except PackageNotFoundError:
     # Source-tree imports before a wheel/editable install still expose a useful
     # version; release metadata is checked against Cargo and pyproject.
     __version__ = "0.1.0"
+
+
+def sort(input, output, *, disk_sort=False) -> None:
+    """Sort a GFF/GFF3 or BED file into ``output``.
+
+    The input format is inferred from its extension. Set ``disk_sort=True``
+    for files that may not fit in memory.
+    """
+    return _sort(input, output, disk_sort=disk_sort)
 
 
 def build_index(

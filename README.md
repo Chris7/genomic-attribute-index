@@ -23,10 +23,12 @@ $ gai build-index annotations.gff3.gz \
 $ gai query-index annotations.gff3.gz BRCA1
 $ gai query-index annotations.gff3.gz BRCA --match prefix
 $ gai inspect-index annotations.gff3.gz.gai
+$ gai sort annotations.gff3 > annotations.sorted.gff3
+$ gai sort annotations.bed > annotations.sorted.bed
 ```
 
-The `gai` binary has exactly three top-level subcommands: `build-index`,
-`query-index`, and `inspect-index`. A coordinate index is discovered from an
+The `gai` binary has four top-level subcommands: `build-index`, `query-index`,
+`inspect-index`, and `sort`. A coordinate index is discovered from an
 unambiguous sibling `.tbi` or `.csi`; pass `--coordinate-index` when both are
 present or when the index has a nonstandard name. Query output is lossless GFF3
 record text on stdout, while build progress and phase timings go to stderr.
@@ -40,6 +42,12 @@ Queries use exact normalized value matching by default. Pass the typed
 `--match prefix` option to stream every configured attribute value beginning
 with the normalized query from the FST; `--match exact` is equivalent to the
 default. No substring or fuzzy matching is provided.
+
+`gai sort` infers GFF/GFF3 or BED from the input extension and writes sorted
+records to stdout. GFF comment and directive lines remain first in source order;
+feature records sort by contig, start, and end, with `ID`/`Parent` hierarchy
+putting parents before children when all three coordinates tie. BED records use
+the same contig/start/end ordering.
 
 The build scan uses one reusable noodles GFF3 parser over either BGZF or plain
 input, stops feature extraction at `##FASTA`, and hashes the exact complete

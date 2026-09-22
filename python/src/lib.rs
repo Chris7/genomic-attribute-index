@@ -1,8 +1,13 @@
-use std::{path::PathBuf, sync::Mutex};
+use std::{
+    fs::File,
+    io::{BufWriter, Write},
+    path::PathBuf,
+    sync::Mutex,
+};
 
 use gai::{
     BuildOptions, Error, GffRecord, IndexMetadata, IndexStats, IndexedGff, MatchMode,
-    NameIndexOptions, QueryStats, build_name_index_with_options,
+    NameIndexOptions, QueryStats, build_name_index_with_options, sort_file,
 };
 use pyo3::{
     Bound, PyResult, Python, create_exception, exceptions::PyException, prelude::PyModule, pyclass,
@@ -429,6 +434,19 @@ impl PyIndexedGff {
 }
 
 #[pyfunction]
+#[pyo3(signature = (input, output, *, disk_sort=false))]
+fn sort(py: Python<'_>, input: PathBuf, output: PathBuf, disk_sort: bool) -> PyResult<()> {
+    py.allow_threads(|| -> Result<(), Error> {
+        let output = File::create(output)?;
+        let mut writer = BufWriter::new(output);
+        sort_file(input, disk_sort, &mut writer)?;
+        writer.flush()?;
+        Ok(())
+    })
+    .map_err(to_py_error)
+}
+
+#[pyfunction]
 #[pyo3(signature = (input, coordinate_index, output, attributes, case_sensitive=false, memory_budget=67108864, compression_threads=None, bgzf_threads=None))]
 #[allow(clippy::too_many_arguments)]
 fn build_index(
@@ -509,6 +527,7 @@ fn _gai(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyBuildStats>()?;
     m.add_class::<PyQueryStats>()?;
     m.add_class::<PyIndexedGff>()?;
+    m.add_function(wrap_pyfunction!(sort, m)?)?;
     m.add_function(wrap_pyfunction!(build_index, m)?)?;
     m.add_function(wrap_pyfunction!(open_index, m)?)?;
     m.add_function(wrap_pyfunction!(query_index, m)?)?;

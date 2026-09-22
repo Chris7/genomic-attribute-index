@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 from pathlib import Path
 
 import pytest
@@ -24,6 +25,16 @@ def _build(
         compression_threads=1,
         bgzf_threads=1,
     )
+
+
+def test_sort(fixture_paths, tmp_path):
+    output = tmp_path / "sorted.gff3"
+    gai.sort(fixture_paths["unsorted_gff"], output)
+    with gzip.open(fixture_paths["source"], "rb") as handle:
+        expected = handle.read()
+    with open(output, "rb") as handle:
+        results = handle.read()
+    assert expected == results
 
 
 def test_build_query_inspect_tbi_and_source_order(fixture_paths, tmp_path):

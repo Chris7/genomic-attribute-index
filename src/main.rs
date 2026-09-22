@@ -3,6 +3,7 @@ use std::{path::PathBuf, process::ExitCode};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use gai::{
     BuildOptions, IndexedGff, MatchMode, NameIndexOptions, Result, build_name_index_with_options,
+    sort_file,
 };
 
 #[derive(Debug, Parser)]
@@ -14,6 +15,9 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Sort GFF/GFF3 or BED records and write the result to stdout.
+    #[command(name = "sort")]
+    Sort(SortArgs),
     /// Build a deterministic Genomic Attribute Index (GAI) for configured GFF3 attributes.
     #[command(name = "build-index")]
     Build(BuildIndexArgs),
@@ -23,6 +27,15 @@ enum Command {
     /// Display GAI format, normalization, fingerprint, and block metadata.
     #[command(name = "inspect-index")]
     Inspect(InspectArgs),
+}
+
+#[derive(Debug, Args)]
+struct SortArgs {
+    /// Input .gff, .gff3, or .bed path; sorted output is written to stdout.
+    input: PathBuf,
+    /// Sort on disk; use for files that may fill memory
+    #[arg(long, alias = "ds")]
+    disk_sort: bool,
 }
 
 #[derive(Debug, Args)]
@@ -111,6 +124,9 @@ fn discover_coordinate_index(input: &std::path::Path) -> Result<PathBuf> {
 
 fn run(cli: Cli) -> Result<()> {
     match cli.command {
+        Command::Sort(arguments) => {
+            sort_file(arguments.input, arguments.disk_sort, std::io::stdout())?;
+        }
         Command::Build(arguments) => {
             let coordinate_index = arguments
                 .coordinate_index

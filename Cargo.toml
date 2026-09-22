@@ -30,14 +30,18 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
+ext-sort = { version = "^0.1.5" }
 crc32fast = "1.4"
 fst = "0.4"
 memmap2 = "0.9"
 noodles = { version = "0.101", features = ["bgzf", "core", "csi", "gff", "tabix"] }
 rayon = "1.11"
+serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 thiserror = "2.0"
 zstd = "0.13"
+flate2 = { version = "1.1.10", default-features = false, features = ["zlib-rs"] }
+natord = "1.0.9"
 
 [dev-dependencies]
 tempfile = "3.20"
@@ -63,3 +67,12 @@ strip = "symbols"
 lto = true
 codegen-units = 1
 panic = "abort"
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev.package.zlib-rs]
+opt-level = 3
+
+[profile.dev.package.crc32fast]
+opt-level = 3

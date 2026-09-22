@@ -41,6 +41,10 @@ use noodles::{
 };
 use sha2::{Digest, Sha256};
 
+mod sort;
+
+pub use sort::{SortFormat, sort_bed, sort_file, sort_gff};
+
 const MAGIC: [u8; 4] = *b"GAI\x01";
 const MAJOR_VERSION: u16 = 1;
 const MINOR_VERSION: u16 = 0;
