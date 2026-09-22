@@ -33,6 +33,9 @@ enum Command {
 struct SortArgs {
     /// Input .gff, .gff3, or .bed path; sorted output is written to stdout.
     input: PathBuf,
+    /// Sort on disk; use for files that may fill memory
+    #[arg(long, alias = "ds")]
+    disk_sort: bool,
 }
 
 #[derive(Debug, Args)]
@@ -122,7 +125,7 @@ fn discover_coordinate_index(input: &std::path::Path) -> Result<PathBuf> {
 fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Sort(arguments) => {
-            sort_file(arguments.input, std::io::stdout())?;
+            sort_file(arguments.input, arguments.disk_sort, std::io::stdout())?;
         }
         Command::Build(arguments) => {
             let coordinate_index = arguments

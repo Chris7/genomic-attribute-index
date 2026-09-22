@@ -1,5 +1,11 @@
-use std::{fs, io::Cursor, path::Path, process::Command};
+use std::{
+    fs,
+    io::{Cursor, Read},
+    path::Path,
+    process::Command,
+};
 
+use flate2::read::MultiGzDecoder;
 use gai::{sort_bed, sort_file, sort_gff};
 use tempfile::tempdir;
 
@@ -19,12 +25,13 @@ fn gff_preserves_headers_and_orders_coordinates_and_hierarchy() {
         "chr1\ts\texon\t10\t20\t.\t+\t.\tID=child;Parent=transcript%201,unrelated\n",
         "#source-order-comment\n",
         "chr1\ts\tgene\t10\t20\t.\t+\t.\tID=gene%201\n",
+        "GLP1\ts\ttranscript\t10\t20\t.\t+\t.\tID=capped\n",
         "chr1\ts\tgene\t10\t19\t.\t+\t.\tID=shorter\n",
         "chr1\ts\tgene\t10\t20\t.\t+\t.\tID=unrelated\n",
         "chr1\ts\ttranscript\t10\t20\t.\t+\t.\tID=transcript%201;Parent=gene%201\n",
     );
     let mut output = Vec::new();
-    sort_gff(Cursor::new(input.as_bytes()), &mut output).expect("GFF should sort");
+    sort_gff(Cursor::new(input.as_bytes()), false, &mut output).expect("GFF should sort");
     let output = lines(output);
 
     assert_eq!(
@@ -38,6 +45,7 @@ fn gff_preserves_headers_and_orders_coordinates_and_hierarchy() {
             "chr1\ts\ttranscript\t10\t20\t.\t+\t.\tID=transcript%201;Parent=gene%201",
             "chr1\ts\texon\t10\t20\t.\t+\t.\tID=child;Parent=transcript%201,unrelated",
             "chr2\ts\tgene\t1\t2\t.\t+\t.\tID=chr2",
+            "GLP1\ts\ttranscript\t10\t20\t.\t+\t.\tID=capped",
         ]
     );
 }
@@ -48,7 +56,8 @@ fn gff_rejects_parent_cycles() {
         "chr1\ts\tgene\t1\t2\t.\t+\t.\tID=a;Parent=b\n",
         "chr1\ts\tgene\t1\t2\t.\t+\t.\tID=b;Parent=a\n",
     );
-    let error = sort_gff(Cursor::new(input.as_bytes()), Vec::new()).expect_err("cycle should fail");
+    let error =
+        sort_gff(Cursor::new(input.as_bytes()), false, Vec::new()).expect_err("cycle should fail");
     assert!(
         error
             .to_string()
@@ -63,7 +72,7 @@ fn gff_parent_hierarchy_does_not_override_coordinate_order() {
         "chr1\ts\tgene\t30\t40\t.\t+\t.\tID=gene\n",
     );
     let mut output = Vec::new();
-    sort_gff(Cursor::new(input.as_bytes()), &mut output).expect("GFF should sort");
+    sort_gff(Cursor::new(input.as_bytes()), false, &mut output).expect("GFF should sort");
     assert_eq!(
         lines(output),
         [
@@ -83,7 +92,7 @@ fn bed_sorts_by_contig_start_and_end_with_stable_ties() {
         "chr1\t2\t10\tsecond\n",
     );
     let mut output = Vec::new();
-    sort_bed(Cursor::new(input.as_bytes()), &mut output).expect("BED should sort");
+    sort_bed(Cursor::new(input.as_bytes()), false, &mut output).expect("BED should sort");
     assert_eq!(
         lines(output),
         [
@@ -100,13 +109,14 @@ fn bed_sorts_by_contig_start_and_end_with_stable_ties() {
 fn malformed_rows_are_actionable() {
     let gff_error = sort_gff(
         Cursor::new(b"chr1\ts\tgene\tbad\t2\t.\t+\t.\t."),
+        false,
         Vec::new(),
     )
     .expect_err("invalid GFF coordinates should fail");
     assert!(gff_error.to_string().contains("GFF line 1"));
     assert!(gff_error.to_string().contains("invalid start"));
 
-    let bed_error = sort_bed(Cursor::new(b"chr1\tnope\t3\n"), Vec::new())
+    let bed_error = sort_bed(Cursor::new(b"chr1\tnope\t3\n"), false, Vec::new())
         .expect_err("invalid BED coordinates should fail");
     assert!(bed_error.to_string().contains("BED line 1"));
     assert!(bed_error.to_string().contains("invalid start"));
@@ -126,7 +136,7 @@ fn real_ecoli_bed_fixture_can_be_reordered_and_sorted() {
     let input = directory.path().join("ecoli-reordered.bed");
     fs::write(&input, fixture_lines.join("\n") + "\n").expect("should write reordered BED");
     let mut output = Vec::new();
-    sort_file(&input, &mut output).expect("fixture should sort");
+    sort_file(&input, false, &mut output).expect("fixture should sort");
     let output = lines(output);
     assert_eq!(output.len(), fixture_lines.len());
     assert_eq!(
@@ -161,7 +171,7 @@ fn real_ecoli_gff_fixture_sorts_without_changing_record_count() {
     let expected_comments = source.lines().filter(|line| line.starts_with('#')).count();
 
     let mut output = Vec::new();
-    sort_file(&fixture, &mut output).expect("supplied GFF fixture should sort");
+    sort_file(&fixture, false, &mut output).expect("supplied GFF fixture should sort");
     let output = lines(output);
     assert_eq!(
         output.iter().filter(|line| !line.starts_with('#')).count(),
@@ -189,6 +199,32 @@ fn real_ecoli_gff_fixture_sorts_without_changing_record_count() {
         }
     }
     assert!(records.windows(2).all(|pair| pair[0] <= pair[1]));
+}
+
+#[test]
+fn disk_sort_gff() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/random.gff.gz");
+    let mut output = Vec::new();
+    sort_file(&fixture, true, &mut output).expect("supplied GFF fixture should sort");
+    let output = lines(output);
+    let mut reader = MultiGzDecoder::new(
+        fs::File::open(Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/random_sorted.gff.gz"))
+            .expect("should open file"),
+    );
+    let mut expected = Vec::new();
+    reader.read_to_end(&mut expected).expect("should read");
+    let expected = lines(expected);
+    assert_eq!(
+        expected
+            .iter()
+            .filter(|line| !line.starts_with('#'))
+            .collect::<Vec<&String>>(),
+        output
+            .iter()
+            .filter(|line| !line.starts_with('#'))
+            .collect::<Vec<&String>>(),
+        "Sorted using disk does not match"
+    );
 }
 
 #[test]

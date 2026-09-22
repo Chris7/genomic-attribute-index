@@ -8,9 +8,18 @@ use std::{
     path::Path,
 };
 
+use ext_sort::{ExternalSorter, ExternalSorterBuilder, LimitedBufferBuilder};
+use flate2::bufread::MultiGzDecoder;
 use noodles::gff;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{Error, Result};
+
+#[cfg(not(test))]
+const SORT_CHUNK_RECORDS: usize = 250_000;
+
+#[cfg(test)]
+const SORT_CHUNK_RECORDS: usize = 10;
 
 /// A supported annotation format for [`sort_file`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -22,115 +31,227 @@ pub enum SortFormat {
 }
 
 impl SortFormat {
-    /// Infers a format from a path's final extension.
+    /// Infers a format from a path's extension, including compressed inputs
+    /// such as .gff.gz, .gff3.bgz, and .bed.bgzf.
     pub fn from_path(path: &Path) -> Result<Self> {
-        let extension = path.extension().and_then(|value| value.to_str());
-        match extension {
-            Some(value) if value.eq_ignore_ascii_case("gff") => Ok(Self::Gff),
-            Some(value) if value.eq_ignore_ascii_case("gff3") => Ok(Self::Gff),
-            Some(value) if value.eq_ignore_ascii_case("bed") => Ok(Self::Bed),
-            Some(value) => Err(Error::InvalidInput(format!(
-                "unsupported sort input extension .{value}; expected .gff, .gff3, or .bed"
+        let mut path = path;
+
+        if path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|ext| {
+                ext.eq_ignore_ascii_case("gz")
+                    || ext.eq_ignore_ascii_case("bgz")
+                    || ext.eq_ignore_ascii_case("bgzf")
+            })
+        {
+            path = path.file_stem().map(Path::new).ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "cannot infer sort input format from {}",
+                    path.display()
+                ))
+            })?;
+        }
+
+        match path.extension().and_then(|value| value.to_str()) {
+            Some(ext) if ext.eq_ignore_ascii_case("gff") || ext.eq_ignore_ascii_case("gff3") => {
+                Ok(Self::Gff)
+            }
+
+            Some(ext) if ext.eq_ignore_ascii_case("bed") => Ok(Self::Bed),
+
+            Some(ext) => Err(Error::InvalidInput(format!(
+                "unsupported sort input extension .{ext}; expected .gff, .gff3, or .bed \
+                 (optionally followed by .gz, .bgz, or .bgzf)"
             ))),
+
             None => Err(Error::InvalidInput(
-                "cannot infer sort input format without a .gff, .gff3, or .bed extension".into(),
+                "cannot infer sort input format; expected .gff, .gff3, or .bed \
+                 (optionally followed by .gz, .bgz, or .bgzf)"
+                    .into(),
             )),
         }
     }
 }
 
-/// Sorts an annotation file inferred from its extension and writes records to
-/// `writer` in lossless text order.
-pub fn sort_file(input: impl AsRef<Path>, writer: impl Write) -> Result<()> {
-    let input = input.as_ref();
-    let format = SortFormat::from_path(input)?;
-    let reader = BufReader::new(File::open(input)?);
-    match format {
-        SortFormat::Gff => sort_gff(reader, writer),
-        SortFormat::Bed => sort_bed(reader, writer),
+pub fn open_reader(path: &Path) -> io::Result<Box<dyn BufRead>> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some(ext)
+            if ext.eq_ignore_ascii_case("gz")
+                || ext.eq_ignore_ascii_case("bgz")
+                || ext.eq_ignore_ascii_case("bgzf") =>
+        {
+            Ok(Box::new(BufReader::new(MultiGzDecoder::new(reader))))
+        }
+
+        _ => Ok(Box::new(reader)),
     }
 }
 
-/// Sorts GFF/GFF3 records by contig, start, and end position.
+/// Sorts an annotation file inferred from its extension and writes records to
+/// `writer` in lossless text order.
+pub fn sort_file(input: impl AsRef<Path>, disk_sort: bool, writer: impl Write) -> Result<()> {
+    let input = input.as_ref();
+    let format = SortFormat::from_path(input)?;
+    let reader = open_reader(input)?;
+    match format {
+        SortFormat::Gff => sort_gff(reader, disk_sort, writer),
+        SortFormat::Bed => sort_bed(reader, disk_sort, writer),
+    }
+}
+
+/// Converts a BufRead into a stream of parsed records.
 ///
-/// All lines beginning with `#` are emitted first in their original order.
-/// Records sharing all three coordinate keys are topologically ordered by
-/// their decoded `ID`/`Parent` attributes, with a stable source-order tie
-/// break for otherwise unrelated records.
-pub fn sort_gff<R: BufRead, W: Write>(mut reader: R, mut writer: W) -> Result<()> {
-    let mut comments = Vec::new();
-    let mut records = Vec::new();
+/// Returning Ok(None) from `parse` skips a line, which is useful for
+/// comments/header lines.
+fn read_records<R, T, F>(mut reader: R, mut parse: F) -> impl Iterator<Item = io::Result<T>>
+where
+    R: BufRead,
+    F: FnMut(&[u8], usize) -> io::Result<Option<T>>,
+{
     let mut line = Vec::new();
     let mut line_number = 0usize;
 
-    loop {
-        line.clear();
-        let bytes_read = reader.read_until(b'\n', &mut line)?;
-        if bytes_read == 0 {
-            break;
+    std::iter::from_fn(move || {
+        loop {
+            line.clear();
+
+            match reader.read_until(b'\n', &mut line) {
+                Ok(0) => return None,
+                Ok(_) => {}
+                Err(error) => return Some(Err(error)),
+            }
+
+            line_number += 1;
+            let raw = strip_line_ending(&line);
+
+            match parse(raw, line_number) {
+                Ok(Some(record)) => return Some(Ok(record)),
+                Ok(None) => continue,
+                Err(error) => return Some(Err(error)),
+            }
         }
-        line_number += 1;
-        let raw = strip_line_ending(&line);
+    })
+}
+
+/// Sort records either in memory or externally on disk.
+///
+/// The input is consumed completely before this function returns, so callers
+/// can safely use state borrowed by the input parser afterward.
+fn sort_records<T, I>(
+    records: I,
+    disk_sort: bool,
+    compare: fn(&T, &T) -> Ordering,
+) -> Result<Box<dyn Iterator<Item = io::Result<T>>>>
+where
+    T: Serialize + DeserializeOwned + Send + 'static,
+    I: IntoIterator<Item = io::Result<T>>,
+{
+    // if disk_sort {
+    let sorter: ExternalSorter<T, io::Error, LimitedBufferBuilder> = ExternalSorterBuilder::new()
+        .with_tmp_dir(Path::new("."))
+        .with_buffer(LimitedBufferBuilder::new(
+            if disk_sort {
+                SORT_CHUNK_RECORDS
+            } else {
+                usize::MAX
+            },
+            true,
+        ))
+        .build()
+        .map_err(io::Error::other)?;
+
+    let records = sorter.sort_by(records, compare).map_err(io::Error::other)?;
+
+    Ok(Box::new(
+        records.map(|record| record.map_err(io::Error::other)),
+    ))
+    // } else {
+    //     let mut records = records.into_iter().collect::<io::Result<Vec<_>>>()?;
+
+    //     records.sort_by(compare);
+
+    //     Ok(Box::new(records.into_iter().map(Ok::<_, io::Error>)))
+    // }
+}
+
+pub fn sort_gff<R: BufRead, W: Write>(reader: R, disk_sort: bool, mut writer: W) -> Result<()> {
+    let mut comments = Vec::new();
+
+    let records = read_records(reader, |raw, line_number| {
         if raw.first() == Some(&b'#') {
             comments.push(raw.to_vec());
-        } else {
-            records.push(parse_gff_record(raw, line_number)?);
+            return Ok(None);
         }
-    }
 
-    records.sort_by(compare_gff_coordinates);
-    let mut output_order = Vec::with_capacity(records.len());
-    let mut offset = 0;
-    while offset < records.len() {
-        let end = records[offset..]
-            .iter()
-            .position(|record| compare_gff_coordinates(&records[offset], record) != Ordering::Equal)
-            .map_or(records.len(), |relative| offset + relative);
-        let order = order_gff_tie_group(&records[offset..end])?;
-        for index in order {
-            output_order.push(offset + index);
-        }
-        offset = end;
-    }
+        parse_gff_record(raw, line_number)
+            .map(Some)
+            .map_err(io::Error::other)
+    });
 
+    let records = sort_records(records, disk_sort, compare_gff_coordinates)?;
+
+    // read_records has been completely consumed by sort_records at this
+    // point, so its mutable borrow of comments is finished.
     for comment in comments {
         write_line(&mut writer, &comment)?;
     }
-    for index in output_order {
-        write_line(&mut writer, &records[index].raw)?;
+
+    let mut group = Vec::new();
+
+    for record in records {
+        let record = record?;
+
+        if group
+            .first()
+            .is_some_and(|first| compare_gff_coordinates(first, &record) != Ordering::Equal)
+        {
+            write_gff_group(&mut writer, &group)?;
+            group.clear();
+        }
+
+        group.push(record);
+    }
+
+    if !group.is_empty() {
+        write_gff_group(&mut writer, &group)?;
+    }
+
+    Ok(())
+}
+
+fn write_gff_group<W: Write>(writer: &mut W, records: &[GffSortRecord]) -> Result<()> {
+    for index in order_gff_tie_group(records)? {
+        write_line(writer, &records[index].raw)?;
     }
 
     Ok(())
 }
 
 /// Sorts BED records by contig, start, and end position.
-pub fn sort_bed<R: BufRead, W: Write>(mut reader: R, mut writer: W) -> Result<()> {
-    let mut records = Vec::new();
-    let mut line = Vec::new();
-    let mut line_number = 0usize;
+pub fn sort_bed<R: BufRead, W: Write>(reader: R, disk_sort: bool, mut writer: W) -> Result<()> {
+    let records = read_records(reader, |raw, line_number| {
+        parse_bed_record(raw, line_number)
+            .map(Some)
+            .map_err(io::Error::other)
+    });
 
-    loop {
-        line.clear();
-        let bytes_read = reader.read_until(b'\n', &mut line)?;
-        if bytes_read == 0 {
-            break;
-        }
-        line_number += 1;
-        let raw = strip_line_ending(&line);
-        records.push(parse_bed_record(raw, line_number)?);
-    }
+    let records = sort_records(records, disk_sort, compare_bed_records)?;
 
-    records.sort_by(compare_bed_records);
     for record in records {
-        write_line(&mut writer, &record.raw)?;
+        write_line(&mut writer, &record?.raw)?;
     }
+
     Ok(())
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 struct GffSortRecord {
     raw: Vec<u8>,
-    contig: Vec<u8>,
+    contig: String,
     start: u64,
     end: u64,
     ids: Vec<Vec<u8>>,
@@ -138,10 +259,10 @@ struct GffSortRecord {
     source_index: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 struct BedSortRecord {
     raw: Vec<u8>,
-    contig: Vec<u8>,
+    contig: String,
     start: u64,
     end: u64,
     source_index: usize,
@@ -176,7 +297,7 @@ fn parse_gff_record(raw: &[u8], line_number: usize) -> Result<GffSortRecord> {
             )
         })?;
 
-    let contig = record.reference_sequence_name().to_vec();
+    let contig = record.reference_sequence_name().to_string();
     if contig.is_empty() {
         return Err(invalid_line(
             "GFF",
@@ -273,7 +394,7 @@ fn parse_bed_record(raw: &[u8], line_number: usize) -> Result<BedSortRecord> {
     }
     Ok(BedSortRecord {
         raw: raw.to_vec(),
-        contig: fields[0].to_vec(),
+        contig: String::from_utf8_lossy(fields[0]).to_string(),
         start,
         end,
         source_index: line_number,
@@ -298,15 +419,13 @@ fn parse_coordinate(value: &[u8], name: &str, format: &str, line_number: usize) 
 }
 
 fn compare_gff_coordinates(left: &GffSortRecord, right: &GffSortRecord) -> Ordering {
-    left.contig
-        .cmp(&right.contig)
+    natord::compare_ignore_case(&left.contig, &right.contig)
         .then_with(|| left.start.cmp(&right.start))
         .then_with(|| left.end.cmp(&right.end))
 }
 
 fn compare_bed_records(left: &BedSortRecord, right: &BedSortRecord) -> Ordering {
-    left.contig
-        .cmp(&right.contig)
+    natord::compare_ignore_case(&left.contig, &right.contig)
         .then_with(|| left.start.cmp(&right.start))
         .then_with(|| left.end.cmp(&right.end))
         .then_with(|| left.source_index.cmp(&right.source_index))
@@ -357,9 +476,7 @@ fn order_gff_tie_group(records: &[GffSortRecord]) -> Result<Vec<usize>> {
     if order.len() != records.len() {
         return Err(Error::InvalidInput(format!(
             "GFF parent hierarchy contains a cycle among records on contig {:?} at {}..{}",
-            String::from_utf8_lossy(&records[0].contig),
-            records[0].start,
-            records[0].end
+            records[0].contig, records[0].start, records[0].end
         )));
     }
     Ok(order)
