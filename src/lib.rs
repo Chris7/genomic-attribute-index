@@ -331,7 +331,7 @@ impl BuildOptions {
     }
 }
 
-/// A parsed GFF3 record returned by [`IndexedGff::query_name`].
+/// A parsed source record returned by [`IndexedSource::query_name`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GffRecord {
     /// Reference sequence name.
@@ -423,7 +423,7 @@ pub struct IndexMetadata {
     /// Explicit configured tags.
     pub attributes: Vec<String>,
     /// SHA-256 of the source GFF bytes.
-    pub gff_fingerprint: [u8; 32],
+    pub source_fingerprint: [u8; 32],
     /// SHA-256 of the TBI/CSI bytes.
     pub coordinate_index_fingerprint: [u8; 32],
     /// SHA-256 of the reference dictionary.
@@ -1998,7 +1998,7 @@ fn encode_directory(entries: &[SectionDirectoryEntry]) -> Result<Vec<u8>> {
 fn serialize_index(
     attributes: &[String],
     case_sensitive: bool,
-    gff_fingerprint: [u8; 32],
+    source_fingerprint: [u8; 32],
     coordinate_index_fingerprint: [u8; 32],
     reference_dictionary_fingerprint: [u8; 32],
     term_count: u64,
@@ -2100,7 +2100,7 @@ fn serialize_index(
     set_u64(&mut output, 48, posting_count);
     set_u64(&mut output, 56, postings_block_count);
     set_u64(&mut output, 64, span_block_count);
-    output[72..104].copy_from_slice(&gff_fingerprint);
+    output[72..104].copy_from_slice(&source_fingerprint);
     output[104..136].copy_from_slice(&coordinate_index_fingerprint);
     output[136..168].copy_from_slice(&reference_dictionary_fingerprint);
     set_u32(&mut output, 168, attributes.len() as u32);
@@ -2552,14 +2552,18 @@ fn report_progress(
     }
 }
 
-fn scan_index_path<F>(
-    path: &Path,
+struct ScanIndexContext<'a> {
     format: SortFormat,
     bgzf_threads: usize,
     bytes_read: Arc<AtomicU64>,
-    reference_ids: &HashMap<String, u32>,
-    configured: &HashSet<String>,
+    reference_ids: &'a HashMap<String, u32>,
+    configured: &'a HashSet<String>,
     case_sensitive: bool,
+}
+
+fn scan_index_path<F>(
+    path: &Path,
+    context: ScanIndexContext<'_>,
     mut process: F,
 ) -> Result<([u8; 32], u64)>
 where
@@ -2569,36 +2573,36 @@ where
     let mut magic = [0_u8; 2];
     let magic_length = source.read(&mut magic)?;
     source.rewind()?;
-    let hashing = HashingReader::with_counter(source, bytes_read);
+    let hashing = HashingReader::with_counter(source, context.bytes_read);
     if magic_length == magic.len() && magic == [0x1f, 0x8b] {
-        if bgzf_threads > 1 {
-            let workers = NonZeroUsize::new(bgzf_threads)
+        if context.bgzf_threads > 1 {
+            let workers = NonZeroUsize::new(context.bgzf_threads)
                 .ok_or_else(|| Error::InvalidInput("BGZF worker count must be positive".into()))?;
             scan_index_reader(
                 bgzf::io::MultithreadedReader::with_worker_count(workers, hashing),
-                format,
-                reference_ids,
-                configured,
-                case_sensitive,
+                context.format,
+                context.reference_ids,
+                context.configured,
+                context.case_sensitive,
                 &mut process,
             )
         } else {
             scan_index_reader(
                 bgzf::io::Reader::new(hashing),
-                format,
-                reference_ids,
-                configured,
-                case_sensitive,
+                context.format,
+                context.reference_ids,
+                context.configured,
+                context.case_sensitive,
                 &mut process,
             )
         }
     } else {
         scan_index_reader(
             BufReader::new(hashing),
-            format,
-            reference_ids,
-            configured,
-            case_sensitive,
+            context.format,
+            context.reference_ids,
+            context.configured,
+            context.case_sensitive,
             &mut process,
         )
     }
@@ -2783,12 +2787,14 @@ pub fn build_name_index_with_options_and_span_block_size(
     };
     let (source_fingerprint, source_bytes) = scan_index_path(
         source_path,
-        source_format,
-        build_options.bgzf_threads,
-        Arc::clone(&bytes_read),
-        &reference_ids,
-        &configured,
-        name_options.case_sensitive,
+        ScanIndexContext {
+            format: source_format,
+            bgzf_threads: build_options.bgzf_threads,
+            bytes_read: Arc::clone(&bytes_read),
+            reference_ids: &reference_ids,
+            configured: &configured,
+            case_sensitive: name_options.case_sensitive,
+        },
         &mut process_record,
     )?;
     let scan_duration = scan_started.elapsed();
@@ -3091,7 +3097,7 @@ impl NameIndexReader {
         {
             return Err(Error::Corrupt("inconsistent GAI counts".into()));
         }
-        let gff_fingerprint = read_array::<32>(bytes, &mut offset, "GFF fingerprint")?;
+        let source_fingerprint = read_array::<32>(bytes, &mut offset, "source fingerprint")?;
         let coordinate_index_fingerprint =
             read_array::<32>(bytes, &mut offset, "coordinate-index fingerprint")?;
         let reference_dictionary_fingerprint =
@@ -3299,7 +3305,7 @@ impl NameIndexReader {
                 minor_version,
                 case_sensitive: normalization == NORMALIZATION_CASE_SENSITIVE,
                 attributes,
-                gff_fingerprint,
+                source_fingerprint,
                 coordinate_index_fingerprint,
                 reference_dictionary_fingerprint,
                 term_count,
@@ -4027,27 +4033,28 @@ fn decode_span_row(
         .ok_or_else(|| Error::Corrupt("span row is out of bounds".into()))
 }
 
-/// An indexed GFF3 source, its TBI/CSI coordinate index, and a GAI reader.
-pub struct IndexedGff {
-    gff_path: PathBuf,
+/// An indexed GFF3 or BED source, its TBI/CSI coordinate index, and a GAI reader.
+pub struct IndexedSource {
+    source_path: PathBuf,
+    source_format: SortFormat,
     coordinate_index_path: PathBuf,
     coordinate_index: CoordinateIndex,
     dictionary: CoordinateDictionary,
     reference_ids: HashMap<String, u32>,
-    configured_attributes: HashSet<String>,
+    configured_terms: HashSet<String>,
     name_index: NameIndexReader,
 }
 
-impl IndexedGff {
+impl IndexedSource {
     /// Opens a source, coordinate index, and GAI and rejects stale pairs by
     /// checking all source, index, and reference-dictionary fingerprints.
     pub fn open(
-        gff_path: impl AsRef<Path>,
+        source_path: impl AsRef<Path>,
         coordinate_index_path: impl AsRef<Path>,
         gai_path: impl AsRef<Path>,
     ) -> Result<Self> {
         Self::open_inner(
-            gff_path.as_ref(),
+            source_path.as_ref(),
             coordinate_index_path.as_ref(),
             gai_path.as_ref(),
             None,
@@ -4057,14 +4064,14 @@ impl IndexedGff {
     /// Opens an indexed source while additionally checking the caller's
     /// attribute and normalization configuration against the stored header.
     pub fn open_with_options(
-        gff_path: impl AsRef<Path>,
+        source_path: impl AsRef<Path>,
         coordinate_index_path: impl AsRef<Path>,
         gai_path: impl AsRef<Path>,
         options: &NameIndexOptions,
     ) -> Result<Self> {
         let options = NameIndexOptions::new(options.attributes.clone(), options.case_sensitive)?;
         Self::open_inner(
-            gff_path.as_ref(),
+            source_path.as_ref(),
             coordinate_index_path.as_ref(),
             gai_path.as_ref(),
             Some(&options),
@@ -4072,19 +4079,20 @@ impl IndexedGff {
     }
 
     fn open_inner(
-        gff_path: &Path,
+        source_path: &Path,
         coordinate_index_path: &Path,
         gai_path: &Path,
         options: Option<&NameIndexOptions>,
     ) -> Result<Self> {
-        let gff_path = gff_path.to_path_buf();
+        let source_path = source_path.to_path_buf();
         let coordinate_index_path = coordinate_index_path.to_path_buf();
+        let source_format = SortFormat::from_path(&source_path)?;
         let name_index = NameIndexReader::open_mmap(gai_path)?;
         let (coordinate_index, coordinate_index_fingerprint) =
             read_coordinate_index_with_fingerprint(&coordinate_index_path)?;
-        let dictionary = coordinate_index.dictionary(SortFormat::Gff)?;
-        if fingerprint_file(&gff_path)? != name_index.metadata.gff_fingerprint {
-            return Err(Error::Stale("source GFF fingerprint does not match".into()));
+        let dictionary = coordinate_index.dictionary(source_format)?;
+        if fingerprint_file(&source_path)? != name_index.metadata.source_fingerprint {
+            return Err(Error::Stale("source fingerprint does not match".into()));
         }
         if coordinate_index_fingerprint != name_index.metadata.coordinate_index_fingerprint {
             return Err(Error::Stale("TBI/CSI fingerprint does not match".into()));
@@ -4126,14 +4134,15 @@ impl IndexedGff {
             .enumerate()
             .map(|(index, name)| (name.clone(), index as u32))
             .collect();
-        let configured_attributes = name_index.metadata.attributes.iter().cloned().collect();
+        let configured_terms = name_index.metadata.attributes.iter().cloned().collect();
         Ok(Self {
-            gff_path,
+            source_path,
+            source_format,
             coordinate_index_path,
             coordinate_index,
             dictionary,
             reference_ids,
-            configured_attributes,
+            configured_terms,
             name_index,
         })
     }
@@ -4143,7 +4152,7 @@ impl IndexedGff {
         self.name_index.metadata()
     }
 
-    /// Queries a configured attribute value exactly and returns matching
+    /// Queries a configured attribute value or BED name exactly and returns matching
     /// records in source coordinate order. Each posted span is queried as an
     /// exact coordinate interval; returned chunks are then merged and read
     /// once. Unknown terms are successful empty queries.
@@ -4157,7 +4166,7 @@ impl IndexedGff {
         self.query_name_with_mode_and_stats(term, MatchMode::Exact)
     }
 
-    /// Queries a configured attribute value using an explicit match mode.
+    /// Queries a configured attribute value or BED name using an explicit match mode.
     /// Prefix mode streams every indexed value beginning with the normalized
     /// query from the FST, unions their spans, and uses the same batched
     /// TBI/CSI retrieval as exact queries.
@@ -4170,7 +4179,7 @@ impl IndexedGff {
             .map(|(records, _)| records)
     }
 
-    /// Queries a configured attribute value using an explicit match mode and
+    /// Queries a configured attribute value or BED name using an explicit match mode and
     /// returns bounded query instrumentation.
     pub fn query_name_with_mode_and_stats(
         &mut self,
@@ -4239,12 +4248,18 @@ impl IndexedGff {
         let context = QueryReadContext {
             requested_spans: &requested_spans,
             reference_ids: &self.reference_ids,
-            configured_attributes: &self.configured_attributes,
+            configured_terms: &self.configured_terms,
             case_sensitive: self.name_index.metadata.case_sensitive,
             normalized_query: &normalized_query,
             match_mode,
         };
-        let records = read_query_chunks(&self.gff_path, &merged_chunks, &context, &mut stats)?;
+        let records = read_query_chunks(
+            &self.source_path,
+            self.source_format,
+            &merged_chunks,
+            &context,
+            &mut stats,
+        )?;
         Ok((records, stats))
     }
 
@@ -4279,19 +4294,32 @@ fn merge_query_chunks(mut chunks: Vec<Chunk>) -> Vec<Chunk> {
 struct QueryReadContext<'a> {
     requested_spans: &'a HashSet<SpanKey>,
     reference_ids: &'a HashMap<String, u32>,
-    configured_attributes: &'a HashSet<String>,
+    configured_terms: &'a HashSet<String>,
     case_sensitive: bool,
     normalized_query: &'a str,
     match_mode: MatchMode,
 }
 
 fn read_query_chunks(
-    gff_path: &Path,
+    source_path: &Path,
+    source_format: SortFormat,
     chunks: &[Chunk],
     context: &QueryReadContext<'_>,
     stats: &mut QueryStats,
 ) -> Result<Vec<GffRecord>> {
-    let source = File::open(gff_path)?;
+    let source = File::open(source_path)?;
+    match source_format {
+        SortFormat::Gff => read_gff_query_chunks(source, chunks, context, stats),
+        SortFormat::Bed => read_bed_query_chunks(source, chunks, context, stats),
+    }
+}
+
+fn read_gff_query_chunks(
+    source: File,
+    chunks: &[Chunk],
+    context: &QueryReadContext<'_>,
+    stats: &mut QueryStats,
+) -> Result<Vec<GffRecord>> {
     let mut reader = gff::io::Reader::new(bgzf::io::Reader::new(source));
     let mut line = gff::Line::default();
     let mut positions = HashSet::new();
@@ -4326,7 +4354,7 @@ fn read_query_chunks(
             }
             if !feature_record_matches_term(
                 &record,
-                context.configured_attributes,
+                context.configured_terms,
                 context.case_sensitive,
                 context.normalized_query,
                 context.match_mode,
@@ -4339,6 +4367,100 @@ fn read_query_chunks(
                 parsed_record_from_feature_record(&record, raw_line, context.reference_ids)?;
             stats.matching_records += 1;
             records.push(parsed.record);
+        }
+    }
+    Ok(records)
+}
+
+fn read_bed_query_chunks(
+    source: File,
+    chunks: &[Chunk],
+    context: &QueryReadContext<'_>,
+    stats: &mut QueryStats,
+) -> Result<Vec<GffRecord>> {
+    let mut reader = bgzf::io::Reader::new(source);
+    let mut positions = HashSet::new();
+    let mut records = Vec::new();
+    let mut line = Vec::new();
+    let mut line_number = 0_usize;
+    for chunk in chunks {
+        reader.seek_to_virtual_position(chunk.start())?;
+        loop {
+            let source_position = reader.virtual_position();
+            if source_position >= chunk.end() {
+                break;
+            }
+            line.clear();
+            let length = reader.read_until(b'\n', &mut line)?;
+            if length == 0 {
+                break;
+            }
+            line_number += 1;
+            stats.bytes_read = stats
+                .bytes_read
+                .checked_add(length as u64)
+                .ok_or(Error::InvalidCoordinate)?;
+            let raw = line.strip_suffix(b"\n").unwrap_or(&line);
+            let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
+            if raw.is_empty()
+                || raw.first() == Some(&b'#')
+                || raw.starts_with(b"track ")
+                || raw.starts_with(b"browser ")
+            {
+                continue;
+            }
+            if !positions.insert(u64::from(source_position)) {
+                continue;
+            }
+            stats.unique_candidate_records += 1;
+            let extracted = extract_bed_record(
+                raw,
+                line_number,
+                context.reference_ids,
+                context.case_sensitive,
+            )?;
+            if !context.requested_spans.contains(&extracted.span) {
+                continue;
+            }
+            let matches = extracted
+                .terms
+                .iter()
+                .any(|value| match context.match_mode {
+                    MatchMode::Exact => value == context.normalized_query,
+                    MatchMode::Prefix => value.starts_with(context.normalized_query),
+                });
+            if !matches {
+                continue;
+            }
+            let fields = raw.split(|byte| *byte == b'\t').collect::<Vec<_>>();
+            let reference_sequence_name = String::from_utf8(fields[0].to_vec())
+                .map_err(|_| Error::InvalidInput("BED record is not UTF-8".into()))?;
+            let name = fields
+                .get(3)
+                .map(|field| String::from_utf8(field.to_vec()))
+                .transpose()
+                .map_err(|_| Error::InvalidInput("BED name is not UTF-8".into()))?
+                .unwrap_or_default();
+            let start = extracted.span.start + 1;
+            let end = extracted
+                .span
+                .start
+                .checked_add(extracted.span.length)
+                .ok_or(Error::InvalidCoordinate)?;
+            records.push(GffRecord {
+                reference_sequence_name,
+                source: ".".to_string(),
+                ty: "bed".to_string(),
+                start,
+                end,
+                score: ".".to_string(),
+                strand: ".".to_string(),
+                phase: ".".to_string(),
+                attributes: vec![("name".to_string(), vec![name])],
+                raw_line: String::from_utf8(raw.to_vec())
+                    .map_err(|_| Error::InvalidInput("BED record is not UTF-8".into()))?,
+            });
+            stats.matching_records += 1;
         }
     }
     Ok(records)
@@ -4646,7 +4768,7 @@ mod tests {
                 .is_empty()
         );
 
-        let mut indexed = IndexedGff::open(&source, &coordinate_index, &destination)
+        let mut indexed = IndexedSource::open(&source, &coordinate_index, &destination)
             .expect("should open indexed source");
         let records = indexed.query_name(" BRCA1 ").expect("should query name");
         assert_eq!(records.len(), 3);
@@ -4716,6 +4838,27 @@ mod tests {
         let case_reader = NameIndexReader::open(case_destination).unwrap();
         assert_eq!(case_reader.lookup_span_ids("Alpha").unwrap(), vec![0, 2]);
         assert!(case_reader.lookup_span_ids("alpha").unwrap().is_empty());
+
+        let mut indexed = IndexedSource::open(&source, &coordinate_index, &destination)
+            .expect("should open BED indexed source");
+        let records = indexed.query_name("alpha").expect("should query BED name");
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.raw_line.as_str())
+                .collect::<Vec<_>>(),
+            vec!["chr1\t0\t10\tAlpha", "chr2\t5\t7\tAlpha"]
+        );
+        assert_eq!(records[0].start, 1);
+        assert_eq!(records[0].end, 10);
+        assert_eq!(
+            records[0].attribute_values("name").collect::<Vec<_>>(),
+            vec!["Alpha"]
+        );
+        let prefix = indexed
+            .query_name_with_mode("al", MatchMode::Prefix)
+            .expect("should query BED name prefix");
+        assert_eq!(prefix.len(), 2);
     }
 
     #[test]
@@ -4769,7 +4912,7 @@ mod tests {
         source_bytes.push(0);
         fs::write(&stale_source, source_bytes).expect("should alter source");
         assert!(matches!(
-            IndexedGff::open(&stale_source, &coordinate_index, &destination),
+            IndexedSource::open(&stale_source, &coordinate_index, &destination),
             Err(Error::Stale(_))
         ));
         let stale_coordinate_index = directory.path().join("stale.gff3.gz.tbi");
@@ -4777,7 +4920,7 @@ mod tests {
         let mut coordinate_bytes = fs::read(&stale_coordinate_index).unwrap();
         coordinate_bytes.push(0);
         fs::write(&stale_coordinate_index, coordinate_bytes).unwrap();
-        assert!(IndexedGff::open(&source, &stale_coordinate_index, &destination).is_err());
+        assert!(IndexedSource::open(&source, &stale_coordinate_index, &destination).is_err());
     }
 
     #[test]
@@ -5189,7 +5332,7 @@ mod tests {
         .unwrap();
         let reader = NameIndexReader::open(&destination).unwrap();
         assert_eq!(reader.lookup_span_ids("shared").unwrap(), vec![0, 1]);
-        let mut indexed = IndexedGff::open(&source_path, &index_path, &destination).unwrap();
+        let mut indexed = IndexedSource::open(&source_path, &index_path, &destination).unwrap();
         let (records, stats) = indexed.query_name_with_stats("shared").unwrap();
         assert_eq!(records.len(), 2);
         assert_eq!(stats.requested_spans, 2);
@@ -5217,7 +5360,7 @@ mod tests {
         )
         .expect("should build overlap GAI");
 
-        let mut indexed = IndexedGff::open(&source, &coordinate_index, &destination)
+        let mut indexed = IndexedSource::open(&source, &coordinate_index, &destination)
             .expect("should open overlap GAI");
         let (records, stats) = indexed
             .query_name_with_stats("overlap")
@@ -5300,12 +5443,19 @@ mod tests {
         let context = QueryReadContext {
             requested_spans: &requested_spans,
             reference_ids: &reference_ids,
-            configured_attributes: &configured_attributes,
+            configured_terms: &configured_attributes,
             case_sensitive: false,
             normalized_query: "dedup",
             match_mode: MatchMode::Exact,
         };
-        let records = read_query_chunks(&source, &duplicated_chunks, &context, &mut stats).unwrap();
+        let records = read_query_chunks(
+            &source,
+            SortFormat::Gff,
+            &duplicated_chunks,
+            &context,
+            &mut stats,
+        )
+        .unwrap();
         assert_eq!(records.len(), 2);
         assert_eq!(stats.unique_candidate_records, 2);
         assert_eq!(stats.matching_records, 2);
@@ -5329,7 +5479,7 @@ mod tests {
             &NameIndexOptions::new(["Name"], false).unwrap(),
         )
         .expect("should build same-start GAI");
-        let mut indexed = IndexedGff::open(&source, &coordinate_index, &destination)
+        let mut indexed = IndexedSource::open(&source, &coordinate_index, &destination)
             .expect("should open same-start GAI");
         let records = indexed.query_name("same-start").unwrap();
         assert_eq!(records.len(), 2);
@@ -5351,7 +5501,7 @@ mod tests {
             &NameIndexOptions::new(["Name"], false).unwrap(),
         )
         .expect("should parse a valid index with a nonstandard filename");
-        let mut indexed = IndexedGff::open(&source, &renamed_index, &destination)
+        let mut indexed = IndexedSource::open(&source, &renamed_index, &destination)
             .expect("should open renamed coordinate index");
         assert_eq!(indexed.query_name("brca1").unwrap().len(), 2);
 
@@ -5517,7 +5667,7 @@ mod tests {
             &NameIndexOptions::new(["Name"], false).unwrap(),
         )
         .expect("should build large-feature GAI");
-        let mut indexed = IndexedGff::open(&source, &coordinate_index, &destination)
+        let mut indexed = IndexedSource::open(&source, &coordinate_index, &destination)
             .expect("should open large-feature GAI");
         let records = indexed.query_name("large").unwrap();
         assert_eq!(records.len(), 1);
@@ -5669,8 +5819,8 @@ mod tests {
 
         write_source("TTTTCCCC");
         assert!(matches!(
-            IndexedGff::open(&source, &coordinate_index, &destination),
-            Err(Error::Stale(message)) if message.contains("source GFF")
+            IndexedSource::open(&source, &coordinate_index, &destination),
+            Err(Error::Stale(message)) if message.contains("source fingerprint")
         ));
     }
 
@@ -5799,7 +5949,7 @@ mod tests {
         let reader = NameIndexReader::open(&destination).unwrap();
         assert_eq!(reader.metadata().term_count, 0);
         assert!(reader.lookup_span_ids("anything").unwrap().is_empty());
-        let mut indexed = IndexedGff::open(&source, &coordinate_index, &destination).unwrap();
+        let mut indexed = IndexedSource::open(&source, &coordinate_index, &destination).unwrap();
         let (records, stats) = indexed.query_name_with_stats("anything").unwrap();
         assert!(records.is_empty());
         assert_eq!(stats, QueryStats::default());
@@ -5817,7 +5967,7 @@ mod tests {
             &NameIndexOptions::new(["Name", "Alias"], false).unwrap(),
         )
         .unwrap();
-        let mut indexed = IndexedGff::open(&source, &coordinate_index, &destination).unwrap();
+        let mut indexed = IndexedSource::open(&source, &coordinate_index, &destination).unwrap();
         let (records, stats) = indexed.query_name_with_stats("brca1").unwrap();
         assert_eq!(records.len(), 3);
         assert_eq!(records[2].reference_sequence_name, "chr2");
@@ -5928,7 +6078,7 @@ mod tests {
         let bad_span_destination = directory.path().join("bad-span-ref.gai");
         fs::write(&bad_span_destination, &bad_span_ref).unwrap();
         assert!(matches!(
-            IndexedGff::open(&source, &coordinate_index, &bad_span_destination),
+            IndexedSource::open(&source, &coordinate_index, &bad_span_destination),
             Err(Error::Corrupt(_))
         ));
 
@@ -5937,7 +6087,7 @@ mod tests {
         let bad_reference_count_destination = directory.path().join("bad-reference-count.gai");
         fs::write(&bad_reference_count_destination, &bad_reference_count).unwrap();
         assert!(matches!(
-            IndexedGff::open(&source, &coordinate_index, &bad_reference_count_destination),
+            IndexedSource::open(&source, &coordinate_index, &bad_reference_count_destination),
             Err(Error::Corrupt(_))
         ));
 

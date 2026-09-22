@@ -16,7 +16,7 @@ from ._gai import (
     GaiIoError,
     GaiStaleError,
     IndexMetadata,
-    IndexedGff,
+    IndexedSource,
     QueryStats,
     __version__ as _extension_version,
     build_index as _build_index,
@@ -35,7 +35,7 @@ __all__ = [
     "GaiIoError",
     "GaiStaleError",
     "IndexMetadata",
-    "IndexedGff",
+    "IndexedSource",
     "MatchMode",
     "QueryStats",
     "build_index",
@@ -93,7 +93,7 @@ def build_index(
     )
 
 
-def open_index(input, coordinate_index, gai) -> IndexedGff:
+def open_index(input, coordinate_index, gai) -> IndexedSource:
     """Open a source, TBI/CSI index, and matching GAI with stale checks."""
     return _open_index(input, coordinate_index, gai)
 

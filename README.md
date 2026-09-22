@@ -47,7 +47,7 @@ $ gai sort annotations.bed > annotations.sorted.bed
 ## General arguments
 
 A coordinate index is discovered from an unambiguous sibling `.tbi` or `.csi`, but
-can be explicitly referenced by the `--coordinate-index` flag. Query output is lossless GFF3
+can be explicitly referenced by the `--coordinate-index` flag. Query output is lossless source
 record text on stdout, while build progress and phase timings go to stderr.
 
 ## Building an index
@@ -111,8 +111,8 @@ Query time
 | Gencode v46 GFF | gene_name,hgnc_id | brca | prefix | 2312 | 0.107s |
 | Gencode v46 GFF | gene_name,hgnc_id | hgnc:1001 | exact | 154 | 0.073s |
 | Gencode v46 GFF | gene_name,hgnc_id | hgnc:1001 | prefix | 915 | 0.120s |
-| Gencode v46 Bed | name | brca1 | exact | 154 | 0.073s |
-| Gencode v46 Bed | name | brca | prefix | 915 | 0.120s |
+| Gencode v46 Bed | name | ENST00000607096.1 | exact | 1 | 0.022s |
+| Gencode v46 Bed | name | ENST000006070 | prefix | 50 | 0.104s |
 
 
 ## Python API

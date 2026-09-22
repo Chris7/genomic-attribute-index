@@ -53,7 +53,7 @@ def test_build_query_inspect_tbi_and_source_order(fixture_paths, tmp_path):
     assert metadata.attributes == ["Name", "Alias"]
     assert metadata.major_version == 1
     assert metadata.minor_version == 0
-    assert len(metadata.gff_fingerprint) == 64
+    assert len(metadata.source_fingerprint) == 64
 
     records, query_stats = indexed.query_with_stats(" ALPHA ")
     assert [record.raw_line for record in records] == [
