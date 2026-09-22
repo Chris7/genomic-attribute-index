@@ -5,7 +5,7 @@
 
 use std::{path::Path, time::Instant};
 
-use gai::IndexedGff;
+use gai::IndexedSource;
 
 fn main() {
     if cfg!(debug_assertions) {
@@ -25,7 +25,7 @@ fn main() {
     }
 
     let open_started = Instant::now();
-    let mut indexed = IndexedGff::open(source, coordinate_index, gai)
+    let mut indexed = IndexedSource::open(source, coordinate_index, gai)
         .expect("should open the real GENCODE fixture");
     let open_elapsed = open_started.elapsed();
 

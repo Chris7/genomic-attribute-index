@@ -2,7 +2,7 @@ use std::{path::PathBuf, process::ExitCode};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use gai::{
-    BuildOptions, IndexedGff, MatchMode, NameIndexOptions, Result, SortFormat,
+    BuildOptions, IndexedSource, MatchMode, NameIndexOptions, Result, SortFormat,
     build_name_index_with_options, sort_file,
 };
 
@@ -21,7 +21,7 @@ enum Command {
     /// Build a deterministic Genomic Attribute Index (GAI) for configured GFF3 attributes.
     #[command(name = "build-index")]
     Build(BuildIndexArgs),
-    /// Query configured attribute values through TBI/CSI and print GFF3 records.
+    /// Query configured GFF attributes or BED names through TBI/CSI and print records.
     #[command(name = "query-index")]
     Query(QueryIndexArgs),
     /// Display GAI format, normalization, fingerprint, and block metadata.
@@ -40,7 +40,7 @@ struct SortArgs {
 
 #[derive(Debug, Args)]
 struct BuildIndexArgs {
-    /// BGZF GFF3 source.
+    /// BGZF GFF3 or BED source.
     input: PathBuf,
     /// Repeatable configured GFF3 attribute tag. At least one is required.
     #[arg(long = "attribute")]
@@ -67,7 +67,7 @@ struct BuildIndexArgs {
 
 #[derive(Debug, Args)]
 struct QueryIndexArgs {
-    /// BGZF GFF3 source.
+    /// BGZF GFF3 or BED source.
     input: PathBuf,
     /// Query term before normalization.
     term: String,
@@ -200,7 +200,7 @@ fn run(cli: Cli) -> Result<()> {
             let gai = arguments
                 .gai
                 .unwrap_or_else(|| PathBuf::from(format!("{}.gai", arguments.input.display())));
-            let mut indexed = IndexedGff::open(&arguments.input, coordinate_index, gai)?;
+            let mut indexed = IndexedSource::open(&arguments.input, coordinate_index, gai)?;
             for record in
                 indexed.query_name_with_mode(&arguments.term, arguments.match_mode.into())?
             {
@@ -285,7 +285,7 @@ fn run(cli: Cli) -> Result<()> {
                 metadata.compressed_length_blocks
             );
             println!("file bytes: {}", metadata.file_size);
-            println!("GFF SHA-256: {}", hex(&metadata.gff_fingerprint));
+            println!("Source SHA-256: {}", hex(&metadata.source_fingerprint));
             println!(
                 "coordinate-index SHA-256: {}",
                 hex(&metadata.coordinate_index_fingerprint)

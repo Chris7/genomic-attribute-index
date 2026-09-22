@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use gai::{IndexedGff, NameIndexOptions, build_name_index_with_span_block_size};
+use gai::{IndexedSource, NameIndexOptions, build_name_index_with_span_block_size};
 use noodles::{
     bgzf,
     core::Position,
@@ -173,7 +173,7 @@ fn measure_queries(
     gai_path: &std::path::Path,
     query_terms: &[String],
 ) -> (u64, Duration) {
-    let mut reader = IndexedGff::open(source_path, coordinate_index_path, gai_path)
+    let mut reader = IndexedSource::open(source_path, coordinate_index_path, gai_path)
         .expect("should open synthetic indexed GFF");
     let started = Instant::now();
     let mut lookup_bytes = 0_u64;
