@@ -54,19 +54,23 @@ impl SortFormat {
         }
 
         match path.extension().and_then(|value| value.to_str()) {
-            Some(ext) if ext.eq_ignore_ascii_case("gff") || ext.eq_ignore_ascii_case("gff3") => {
+            Some(ext)
+                if ext.eq_ignore_ascii_case("gff")
+                    || ext.eq_ignore_ascii_case("gff3")
+                    || ext.eq_ignore_ascii_case("gtf") =>
+            {
                 Ok(Self::Gff)
             }
 
             Some(ext) if ext.eq_ignore_ascii_case("bed") => Ok(Self::Bed),
 
             Some(ext) => Err(Error::InvalidInput(format!(
-                "unsupported sort input extension .{ext}; expected .gff, .gff3, or .bed \
+                "unsupported sort input extension .{ext}; expected .gff, .gff3, .gtf, or .bed \
                  (optionally followed by .gz, .bgz, or .bgzf)"
             ))),
 
             None => Err(Error::InvalidInput(
-                "cannot infer sort input format; expected .gff, .gff3, or .bed \
+                "cannot infer sort input format; expected .gff, .gff3, .gtf, or .bed \
                  (optionally followed by .gz, .bgz, or .bgzf)"
                     .into(),
             )),
