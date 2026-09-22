@@ -7,11 +7,15 @@ use std::{
 
 use gai::{
     BuildOptions, Error, GffRecord, IndexMetadata, IndexStats, IndexedGff, MatchMode,
-    NameIndexOptions, QueryStats, build_name_index_with_options, sort_file,
+    NameIndexOptions, QueryStats, SortFormat, build_name_index_with_options, sort_file,
 };
 use pyo3::{
-    Bound, PyResult, Python, create_exception, exceptions::PyException, prelude::PyModule, pyclass,
-    pyfunction, pymethods, pymodule, types::PyModuleMethods, wrap_pyfunction,
+    Bound, PyErr, PyResult, Python, create_exception,
+    exceptions::{PyException, PyUserWarning},
+    prelude::PyModule,
+    pyclass, pyfunction, pymethods, pymodule,
+    types::PyModuleMethods,
+    wrap_pyfunction,
 };
 
 create_exception!(
@@ -460,7 +464,24 @@ fn build_index(
     compression_threads: Option<usize>,
     bgzf_threads: Option<usize>,
 ) -> PyResult<PyBuildStats> {
-    let options = NameIndexOptions::new(attributes, case_sensitive).map_err(to_py_error)?;
+    let format = SortFormat::from_path(&input).map_err(to_py_error)?;
+    let options = match format {
+        SortFormat::Gff => {
+            NameIndexOptions::new(attributes, case_sensitive).map_err(to_py_error)?
+        }
+        SortFormat::Bed => {
+            if !attributes.is_empty() {
+                let warning = py.get_type::<PyUserWarning>();
+                PyErr::warn(
+                    py,
+                    &warning,
+                    c"attributes are ignored for BED input; BED indexes the name field (column 4)",
+                    1,
+                )?;
+            }
+            NameIndexOptions::bed(case_sensitive)
+        }
+    };
     let mut build_options = BuildOptions::default().with_memory_budget(memory_budget);
     if let Some(threads) = compression_threads {
         build_options = build_options.with_compression_threads(threads);

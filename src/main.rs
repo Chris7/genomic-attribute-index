@@ -2,8 +2,8 @@ use std::{path::PathBuf, process::ExitCode};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use gai::{
-    BuildOptions, IndexedGff, MatchMode, NameIndexOptions, Result, build_name_index_with_options,
-    sort_file,
+    BuildOptions, IndexedGff, MatchMode, NameIndexOptions, Result, SortFormat,
+    build_name_index_with_options, sort_file,
 };
 
 #[derive(Debug, Parser)]
@@ -43,7 +43,7 @@ struct BuildIndexArgs {
     /// BGZF GFF3 source.
     input: PathBuf,
     /// Repeatable configured GFF3 attribute tag. At least one is required.
-    #[arg(long = "attribute", required = true)]
+    #[arg(long = "attribute")]
     attributes: Vec<String>,
     /// Explicit TBI or CSI path. If omitted, discover an unambiguous sibling.
     #[arg(long = "coordinate-index")]
@@ -134,7 +134,20 @@ fn run(cli: Cli) -> Result<()> {
             let output = arguments
                 .output
                 .unwrap_or_else(|| PathBuf::from(format!("{}.gai", arguments.input.display())));
-            let options = NameIndexOptions::new(arguments.attributes, arguments.case_sensitive)?;
+            let format = SortFormat::from_path(&arguments.input)?;
+            let options = match format {
+                SortFormat::Gff => {
+                    NameIndexOptions::new(arguments.attributes, arguments.case_sensitive)?
+                }
+                SortFormat::Bed => {
+                    if !arguments.attributes.is_empty() {
+                        eprintln!(
+                            "gai: warning: --attribute is ignored for BED input; BED indexes the name field (column 4)"
+                        );
+                    }
+                    NameIndexOptions::bed(arguments.case_sensitive)
+                }
+            };
             let mut build_options = BuildOptions::default()
                 .with_memory_budget(arguments.memory_budget)
                 .with_progress(|progress| {

@@ -53,8 +53,8 @@ record text on stdout, while build progress and phase timings go to stderr.
 ## Building an index
 
 An index is built via the `build-index` command. `--attribute` identifies which attribute values
-to extract and index. It can be repeated to extract multiple attributes By default, the index is streamed
-to stdout and `--output` can be used to save to an explicit path.
+to extract and index. It can be repeated to extract multiple attributes By default, the index is created
+as a .gai file with the same prefix as input. `--output` can be used to save to an explicit path.
 
 For GFF files, values are parsed, percent-decoded, and split into
 valid array values. Normalization trims surrounding Unicode whitespace and,
@@ -90,6 +90,29 @@ records on stdout. Library callers can use `BuildOptions` and its optional
 progress callback without any library-level stderr output.
 
 ## Benchmarks
+
+All files are in compressed bgzip format.
+
+Index build time
+
+| File | Attributes | Anntoation File Size | Index Size |
+| :--- | ---: | ---: | ---: |
+| Gencode v46 GFF | gene_name | 83.53 mb | 4.17 mb |
+| Gencode v46 GFF | gene_name,hgnc_id | 83.53 mb | 4.63 mb |
+| Gencode v46 Bed | name | 10.34 mb | 3.27 mb |
+
+Query time
+
+| Index | Attributes | Query | Query Type | Matching Records | Query Time |
+| :--- | ---: | ---: | ---: |
+| Gencode v46 GFF | gene_name | brca1 | exact | 1436 | 0.088s |
+| Gencode v46 GFF | gene_name | brca | prefix | 2312 | 0.099s |
+| Gencode v46 GFF | gene_name,hgnc_id | brca1 | exact | 1436 | 0.078s |
+| Gencode v46 GFF | gene_name,hgnc_id | brca | prefix | 2312 | 0.107s |
+| Gencode v46 GFF | gene_name,hgnc_id | hgnc:1001 | exact | 154 | 0.073s |
+| Gencode v46 GFF | gene_name,hgnc_id | hgnc:1001 | prefix | 915 | 0.120s |
+| Gencode v46 Bed | name | brca1 | exact | 154 | 0.073s |
+| Gencode v46 Bed | name | brca | prefix | 915 | 0.120s |
 
 
 ## Python API

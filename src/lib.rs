@@ -114,11 +114,11 @@ impl MatchMode {
     }
 }
 
-/// Options controlling which GFF3 attributes are indexed.
+/// Options controlling which annotation values are indexed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NameIndexOptions {
-    /// Attribute tags whose values should become searchable.  The list must
-    /// be nonempty; exact duplicate tags are retained only once.
+    /// GFF3 attribute tags whose values should become searchable. BED input
+    /// always indexes the `name` field (column 4) instead.
     pub attributes: Vec<String>,
     /// If true, trim values without applying ASCII lowercasing.
     pub case_sensitive: bool,
@@ -153,6 +153,15 @@ impl NameIndexOptions {
             attributes: unique,
             case_sensitive,
         })
+    }
+
+    /// Creates options for BED input, whose searchable value is always the
+    /// `name` field in column 4.
+    pub fn bed(case_sensitive: bool) -> Self {
+        Self {
+            attributes: vec!["name".to_string()],
+            case_sensitive,
+        }
     }
 }
 
@@ -540,7 +549,7 @@ enum CoordinateIndex {
 }
 
 impl CoordinateIndex {
-    fn dictionary(&self) -> Result<CoordinateDictionary> {
+    fn dictionary(&self, source_format: SortFormat) -> Result<CoordinateDictionary> {
         let format = match self {
             Self::Tabix(index) => index
                 .header()
@@ -551,7 +560,7 @@ impl CoordinateIndex {
                 .ok_or_else(|| Error::InvalidInput("coordinate index has no header".into()))?
                 .format(),
         };
-        validate_coordinate_index_format(format)?;
+        validate_coordinate_index_format(format, source_format)?;
         let names = match self {
             Self::Tabix(index) => index
                 .header()
@@ -679,19 +688,103 @@ impl HashingInput for bgzf::io::MultithreadedReader<HashingReader<File>> {
     }
 }
 
-fn scan_gff_reader<R, F>(mut reader: gff::io::Reader<R>, mut process: F) -> Result<([u8; 32], u64)>
+fn read_index_records<'a, R>(
+    reader: &'a mut R,
+    format: SortFormat,
+    reference_ids: &'a HashMap<String, u32>,
+    configured: &'a HashSet<String>,
+    case_sensitive: bool,
+) -> impl Iterator<Item = Result<ExtractedRecord>> + 'a
+where
+    R: BufRead,
+{
+    let mut line = Vec::new();
+    let mut line_number = 0_usize;
+    let mut stopped = false;
+
+    std::iter::from_fn(move || {
+        if stopped {
+            return None;
+        }
+
+        loop {
+            line.clear();
+            match reader.read_until(b'\n', &mut line) {
+                Ok(0) => return None,
+                Ok(_) => {}
+                Err(error) => return Some(Err(Error::Io(error))),
+            }
+            line_number += 1;
+
+            let mut raw = line.as_slice();
+            if let Some(stripped) = raw.strip_suffix(b"\n") {
+                raw = stripped;
+            }
+            if let Some(stripped) = raw.strip_suffix(b"\r") {
+                raw = stripped;
+            }
+
+            match format {
+                SortFormat::Gff => {
+                    if raw == b"##FASTA" {
+                        stopped = true;
+                        return None;
+                    }
+                    if raw.first() == Some(&b'#') {
+                        continue;
+                    }
+                    return Some(extract_gff_line(
+                        raw,
+                        line_number,
+                        reference_ids,
+                        configured,
+                        case_sensitive,
+                    ));
+                }
+                SortFormat::Bed => {
+                    if raw.first() == Some(&b'#')
+                        || raw.starts_with(b"track ")
+                        || raw.starts_with(b"browser ")
+                    {
+                        continue;
+                    }
+                    return Some(extract_bed_record(
+                        raw,
+                        line_number,
+                        reference_ids,
+                        case_sensitive,
+                    ));
+                }
+            }
+        }
+    })
+}
+
+fn scan_index_reader<R, F>(
+    mut reader: R,
+    format: SortFormat,
+    reference_ids: &HashMap<String, u32>,
+    configured: &HashSet<String>,
+    case_sensitive: bool,
+    process: &mut F,
+) -> Result<([u8; 32], u64)>
 where
     R: HashingInput,
-    F: FnMut(gff::feature::RecordBuf) -> Result<()>,
+    F: FnMut(ExtractedRecord) -> Result<()>,
 {
-    let mut records = reader.record_bufs();
-    for result in records.by_ref() {
-        let record =
-            result.map_err(|error| Error::InvalidInput(format!("invalid GFF record: {error}")))?;
-        process(record)?;
+    {
+        let records = read_index_records(
+            &mut reader,
+            format,
+            reference_ids,
+            configured,
+            case_sensitive,
+        );
+        for record in records {
+            process(record?)?;
+        }
     }
-    drop(records);
-    reader.into_inner().drain_and_finish().map_err(Error::from)
+    reader.drain_and_finish().map_err(Error::from)
 }
 
 fn read_coordinate_index_with_fingerprint(path: &Path) -> Result<(CoordinateIndex, [u8; 32])> {
@@ -718,11 +811,19 @@ fn read_coordinate_index_with_fingerprint(path: &Path) -> Result<(CoordinateInde
     )))
 }
 
-fn validate_coordinate_index_format(format: Format) -> Result<()> {
-    if format != Format::Generic(CoordinateSystem::Gff) {
-        return Err(Error::InvalidInput(
-            "coordinate index is not a generic GFF coordinate index".into(),
-        ));
+fn validate_coordinate_index_format(format: Format, source_format: SortFormat) -> Result<()> {
+    let expected = match source_format {
+        SortFormat::Gff => CoordinateSystem::Gff,
+        SortFormat::Bed => CoordinateSystem::Bed,
+    };
+    if format != Format::Generic(expected) {
+        let source_name = match source_format {
+            SortFormat::Gff => "GFF",
+            SortFormat::Bed => "BED",
+        };
+        return Err(Error::InvalidInput(format!(
+            "coordinate index is not a generic {source_name} coordinate index"
+        )));
     }
     Ok(())
 }
@@ -894,10 +995,10 @@ struct ExtractedRecord {
 /// Extracts only the coordinate and configured values needed by the builder.
 /// The lossless [`GffRecord`] conversion above remains query-only; this path
 /// intentionally does not clone source, score, strand, phase, or raw text.
-fn extract_record(
+fn extract_gff_record(
     record: &gff::feature::RecordBuf,
     reference_ids: &HashMap<String, u32>,
-    configured: &HashSet<&str>,
+    configured: &HashSet<String>,
     case_sensitive: bool,
 ) -> Result<ExtractedRecord> {
     let reference_sequence_name = String::from_utf8(record.reference_sequence_name().to_vec())
@@ -924,6 +1025,123 @@ fn extract_record(
             }
         }
     }
+    Ok(ExtractedRecord {
+        span: SpanKey {
+            reference_id,
+            start,
+            length,
+        },
+        terms,
+    })
+}
+
+fn extract_gff_line(
+    raw: &[u8],
+    line_number: usize,
+    reference_ids: &HashMap<String, u32>,
+    configured: &HashSet<String>,
+    case_sensitive: bool,
+) -> Result<ExtractedRecord> {
+    let mut parser = gff::io::Reader::new(Cursor::new(raw));
+    let mut line = gff::Line::default();
+    parser.read_line(&mut line).map_err(|error| {
+        Error::InvalidInput(format!("invalid GFF record at line {line_number}: {error}"))
+    })?;
+    let record = line
+        .as_record()
+        .ok_or_else(|| {
+            Error::InvalidInput(format!(
+                "invalid GFF record at line {line_number}: expected a feature record"
+            ))
+        })?
+        .map_err(|error| {
+            Error::InvalidInput(format!("invalid GFF record at line {line_number}: {error}"))
+        })?;
+    let record = gff::feature::RecordBuf::try_from_feature_record(&record).map_err(|error| {
+        Error::InvalidInput(format!("invalid GFF record at line {line_number}: {error}"))
+    })?;
+    extract_gff_record(&record, reference_ids, configured, case_sensitive)
+}
+
+fn extract_bed_record(
+    raw: &[u8],
+    line_number: usize,
+    reference_ids: &HashMap<String, u32>,
+    case_sensitive: bool,
+) -> Result<ExtractedRecord> {
+    if raw.is_empty() || raw.iter().all(u8::is_ascii_whitespace) {
+        return Err(Error::InvalidInput(format!(
+            "invalid BED record at line {line_number}: expected at least 3 tab-separated columns"
+        )));
+    }
+
+    let fields = raw.split(|byte| *byte == b'\t').collect::<Vec<_>>();
+    if fields.len() < 3 {
+        return Err(Error::InvalidInput(format!(
+            "invalid BED record at line {line_number}: expected at least 3 tab-separated columns, found {}",
+            fields.len()
+        )));
+    }
+
+    let reference_sequence_name = std::str::from_utf8(fields[0]).map_err(|_| {
+        Error::InvalidInput(format!(
+            "invalid BED record at line {line_number}: reference sequence name is not UTF-8"
+        ))
+    })?;
+    if reference_sequence_name.is_empty() {
+        return Err(Error::InvalidInput(format!(
+            "invalid BED record at line {line_number}: reference sequence name must not be empty"
+        )));
+    }
+    let reference_id = *reference_ids.get(reference_sequence_name).ok_or_else(|| {
+        Error::InvalidInput(format!(
+            "BED reference sequence {reference_sequence_name:?} is absent from coordinate index"
+        ))
+    })?;
+
+    let parse_coordinate = |raw: &[u8], name: &str| -> Result<u64> {
+        let value = std::str::from_utf8(raw).map_err(|_| {
+            Error::InvalidInput(format!(
+                "invalid BED record at line {line_number}: {name} coordinate is not UTF-8"
+            ))
+        })?;
+        value.parse::<u64>().map_err(|error| {
+            Error::InvalidInput(format!(
+                "invalid BED record at line {line_number}: invalid {name} coordinate {value:?}: {error}"
+            ))
+        })
+    };
+
+    let start = parse_coordinate(fields[1], "start")?;
+    let end = parse_coordinate(fields[2], "end")?;
+    let length = end.checked_sub(start).ok_or_else(|| {
+        Error::InvalidInput(format!(
+            "invalid BED record at line {line_number}: coordinates must satisfy start < end (got {start}..{end})"
+        ))
+    })?;
+    if length == 0 {
+        return Err(Error::InvalidInput(format!(
+            "invalid BED record at line {line_number}: coordinates must satisfy start < end (got {start}..{end})"
+        )));
+    }
+    start.checked_add(length).ok_or(Error::InvalidCoordinate)?;
+
+    let terms = fields
+        .get(3)
+        .map(|name| {
+            std::str::from_utf8(name)
+                .map_err(|_| {
+                    Error::InvalidInput(format!(
+                        "invalid BED record at line {line_number}: name is not UTF-8"
+                    ))
+                })
+                .map(|name| normalize_value(name, case_sensitive))
+        })
+        .transpose()?
+        .filter(|name| !name.is_empty())
+        .into_iter()
+        .collect();
+
     Ok(ExtractedRecord {
         span: SpanKey {
             reference_id,
@@ -2334,14 +2552,18 @@ fn report_progress(
     }
 }
 
-fn scan_gff_path<F>(
+fn scan_index_path<F>(
     path: &Path,
+    format: SortFormat,
     bgzf_threads: usize,
     bytes_read: Arc<AtomicU64>,
-    process: F,
+    reference_ids: &HashMap<String, u32>,
+    configured: &HashSet<String>,
+    case_sensitive: bool,
+    mut process: F,
 ) -> Result<([u8; 32], u64)>
 where
-    F: FnMut(gff::feature::RecordBuf) -> Result<()>,
+    F: FnMut(ExtractedRecord) -> Result<()>,
 {
     let mut source = File::open(path)?;
     let mut magic = [0_u8; 2];
@@ -2352,20 +2574,33 @@ where
         if bgzf_threads > 1 {
             let workers = NonZeroUsize::new(bgzf_threads)
                 .ok_or_else(|| Error::InvalidInput("BGZF worker count must be positive".into()))?;
-            scan_gff_reader(
-                gff::io::Reader::new(bgzf::io::MultithreadedReader::with_worker_count(
-                    workers, hashing,
-                )),
-                process,
+            scan_index_reader(
+                bgzf::io::MultithreadedReader::with_worker_count(workers, hashing),
+                format,
+                reference_ids,
+                configured,
+                case_sensitive,
+                &mut process,
             )
         } else {
-            scan_gff_reader(
-                gff::io::Reader::new(bgzf::io::Reader::new(hashing)),
-                process,
+            scan_index_reader(
+                bgzf::io::Reader::new(hashing),
+                format,
+                reference_ids,
+                configured,
+                case_sensitive,
+                &mut process,
             )
         }
     } else {
-        scan_gff_reader(gff::io::Reader::new(BufReader::new(hashing)), process)
+        scan_index_reader(
+            BufReader::new(hashing),
+            format,
+            reference_ids,
+            configured,
+            case_sensitive,
+            &mut process,
+        )
     }
 }
 
@@ -2451,15 +2686,21 @@ pub fn build_name_index_with_options_and_span_block_size(
         ));
     }
     let started = Instant::now();
-    let gff_path = gff_path.as_ref();
+    let source_path = gff_path.as_ref();
+    let source_format = SortFormat::from_path(source_path)?;
     let coordinate_index_path = coordinate_index_path.as_ref();
     let destination = destination.as_ref();
-    let name_options = NameIndexOptions::new(options.attributes.clone(), options.case_sensitive)?;
+    let name_options = match source_format {
+        SortFormat::Gff => {
+            NameIndexOptions::new(options.attributes.clone(), options.case_sensitive)?
+        }
+        SortFormat::Bed => NameIndexOptions::bed(options.case_sensitive),
+    };
     let destination_parent = destination.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(destination_parent)?;
     let (coordinate_index, coordinate_index_fingerprint) =
         read_coordinate_index_with_fingerprint(coordinate_index_path)?;
-    let dictionary = coordinate_index.dictionary()?;
+    let dictionary = coordinate_index.dictionary(source_format)?;
     let reference_ids = dictionary
         .names
         .iter()
@@ -2473,7 +2714,7 @@ pub fn build_name_index_with_options_and_span_block_size(
         })
         .collect::<Result<HashMap<_, _>>>()?;
 
-    let configured: HashSet<&str> = name_options.attributes.iter().map(String::as_str).collect();
+    let configured: HashSet<String> = name_options.attributes.iter().cloned().collect();
     let mut collector = SpillCollector::new(
         build_options.memory_budget_bytes,
         destination_parent,
@@ -2490,16 +2731,10 @@ pub fn build_name_index_with_options_and_span_block_size(
     let mut spill_duration = Duration::ZERO;
     let mut scan_spill_duration = Duration::ZERO;
     let scan_started = Instant::now();
-    let mut process_record = |record: gff::feature::RecordBuf| -> Result<()> {
+    let mut process_record = |extracted: ExtractedRecord| -> Result<()> {
         records_processed = records_processed
             .checked_add(1)
             .ok_or(Error::InvalidCoordinate)?;
-        let extracted = extract_record(
-            &record,
-            &reference_ids,
-            &configured,
-            name_options.case_sensitive,
-        )?;
         if extracted.terms.is_empty() {
             if records_processed.is_multiple_of(PROGRESS_RECORD_INTERVAL) {
                 report_progress(
@@ -2546,10 +2781,14 @@ pub fn build_name_index_with_options_and_span_block_size(
         }
         Ok(())
     };
-    let (gff_fingerprint, source_bytes) = scan_gff_path(
-        gff_path,
+    let (source_fingerprint, source_bytes) = scan_index_path(
+        source_path,
+        source_format,
         build_options.bgzf_threads,
         Arc::clone(&bytes_read),
+        &reference_ids,
+        &configured,
+        name_options.case_sensitive,
         &mut process_record,
     )?;
     let scan_duration = scan_started.elapsed();
@@ -2613,7 +2852,7 @@ pub fn build_name_index_with_options_and_span_block_size(
     let serialized = serialize_index(
         &name_options.attributes,
         name_options.case_sensitive,
-        gff_fingerprint,
+        source_fingerprint,
         coordinate_index_fingerprint,
         dictionary.fingerprint,
         term_count,
@@ -3843,7 +4082,7 @@ impl IndexedGff {
         let name_index = NameIndexReader::open_mmap(gai_path)?;
         let (coordinate_index, coordinate_index_fingerprint) =
             read_coordinate_index_with_fingerprint(&coordinate_index_path)?;
-        let dictionary = coordinate_index.dictionary()?;
+        let dictionary = coordinate_index.dictionary(SortFormat::Gff)?;
         if fingerprint_file(&gff_path)? != name_index.metadata.gff_fingerprint {
             return Err(Error::Stale("source GFF fingerprint does not match".into()));
         }
@@ -4258,6 +4497,49 @@ mod tests {
         (source_path, index_path)
     }
 
+    fn write_bed_fixture(directory: &Path) -> (PathBuf, PathBuf) {
+        let source_path = directory.join("fixture.bed.gz");
+        let index_path = directory.join("fixture.bed.gz.tbi");
+        let records = [
+            "chr1\t0\t10\tAlpha",
+            "chr1\t20\t25\tBeta",
+            "chr2\t5\t7\tAlpha",
+            "chr2\t8\t9",
+        ];
+        let mut writer = File::create(&source_path)
+            .map(bgzf::io::Writer::new)
+            .expect("should create BGZF BED source");
+        let mut indexer = tabix::index::Indexer::default();
+        indexer.set_header(csi::binning_index::index::header::Builder::bed().build());
+        for line in records {
+            let fields = line.split('\t').collect::<Vec<_>>();
+            let bed_start = fields[1].parse::<usize>().unwrap();
+            let bed_end = fields[2].parse::<usize>().unwrap();
+            let start = Position::try_from(bed_start + 1).unwrap();
+            let end = Position::try_from(bed_end).unwrap();
+            let start_position = writer.virtual_position();
+            writeln!(writer, "{line}").expect("should write BED record");
+            let end_position = writer.virtual_position();
+            indexer
+                .add_record(
+                    fields[0],
+                    start,
+                    end,
+                    Chunk::new(start_position, end_position),
+                )
+                .expect("should index BED record");
+        }
+        writer.finish().expect("should finish BGZF BED source");
+        let index = indexer.build();
+        let mut index_writer = File::create(&index_path)
+            .map(tabix::io::Writer::new)
+            .expect("should create BED TBI");
+        index_writer
+            .write_index(&index)
+            .expect("should write BED TBI");
+        (source_path, index_path)
+    }
+
     fn mutate_section(bytes: &mut [u8], kind: SectionKind, mutate: impl FnOnce(&mut [u8])) {
         let directory_offset =
             usize::try_from(u64::from_le_bytes(bytes[176..184].try_into().unwrap())).unwrap();
@@ -4395,6 +4677,45 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn test_bed_name_index_builds_from_column_four() {
+        let directory = tempdir().expect("should create temp directory");
+        let (source, coordinate_index) = write_bed_fixture(directory.path());
+        let destination = directory.path().join("fixture-bed.gai");
+
+        // BED ignores configured GFF attributes and always indexes column 4 (`name`).
+        let options = NameIndexOptions::new(["DefinitelyIgnored"], false).unwrap();
+        let stats = build_name_index(&source, &coordinate_index, &destination, &options)
+            .expect("should build BED GAI");
+        assert_eq!(stats.records_processed, 4);
+        assert_eq!(stats.records_indexed, 3);
+        assert_eq!(stats.distinct_terms, 2);
+        assert_eq!(stats.unique_spans, 3);
+
+        let reader = NameIndexReader::open(&destination).expect("should open BED GAI");
+        assert_eq!(reader.metadata().attributes, vec!["name"]);
+        assert_eq!(reader.lookup_span_ids("alpha").unwrap(), vec![0, 2]);
+        assert_eq!(reader.lookup_span_ids("beta").unwrap(), vec![1]);
+        assert!(
+            reader
+                .lookup_span_ids("DefinitelyIgnored")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(reader.resolve_span_id(0).unwrap().start, 0);
+        assert_eq!(reader.resolve_span_id(0).unwrap().length, 10);
+        assert_eq!(reader.resolve_span_id(1).unwrap().start, 20);
+        assert_eq!(reader.resolve_span_id(1).unwrap().length, 5);
+
+        let case_destination = directory.path().join("fixture-bed-case.gai");
+        let case_options = NameIndexOptions::new(["Ignored"], true).unwrap();
+        build_name_index(&source, &coordinate_index, &case_destination, &case_options)
+            .expect("should build case-sensitive BED GAI");
+        let case_reader = NameIndexReader::open(case_destination).unwrap();
+        assert_eq!(case_reader.lookup_span_ids("Alpha").unwrap(), vec![0, 2]);
+        assert!(case_reader.lookup_span_ids("alpha").unwrap().is_empty());
     }
 
     #[test]
