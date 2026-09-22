@@ -169,24 +169,57 @@ where
     ))
 }
 
-pub fn sort_gff<R: BufRead, W: Write>(reader: R, disk_sort: bool, mut writer: W) -> Result<()> {
+pub fn sort_gff<R: BufRead, W: Write>(mut reader: R, disk_sort: bool, mut writer: W) -> Result<()> {
     let mut comments = Vec::new();
+    let mut fasta_line = None;
+    let mut line_number = 0;
 
-    let records = read_records(reader, |raw, line_number| {
-        if raw.first() == Some(&b'#') {
-            comments.push(raw.to_vec());
-            return Ok(None);
+    let records = std::iter::from_fn(|| {
+        if fasta_line.is_some() {
+            return None;
         }
 
-        parse_gff_record(raw, line_number)
-            .map(Some)
-            .map_err(io::Error::other)
+        loop {
+            let mut line = Vec::new();
+
+            match reader.read_until(b'\n', &mut line) {
+                Ok(0) => return None,
+                Err(err) => return Some(Err(err)),
+                Ok(_) => {}
+            }
+
+            line_number += 1;
+
+            // Work with the line minus its newline for parsing/comparison.
+            let mut raw = line.as_slice();
+
+            if let Some(stripped) = raw.strip_suffix(b"\n") {
+                raw = stripped;
+            }
+            if let Some(stripped) = raw.strip_suffix(b"\r") {
+                raw = stripped;
+            }
+
+            // This must be checked before the generic comment handling.
+            if raw == b"##FASTA" {
+                // Keep the original bytes, including its line ending.
+                fasta_line = Some(line);
+                return None;
+            }
+
+            if raw.first() == Some(&b'#') {
+                comments.push(raw.to_vec());
+                continue;
+            }
+
+            return Some(parse_gff_record(raw, line_number).map_err(io::Error::other));
+        }
     });
 
+    // This must completely consume `records`.
     let records = sort_records(records, disk_sort, compare_gff_coordinates)?;
 
-    // read_records has been completely consumed by sort_records at this
-    // point, so its mutable borrow of comments is finished.
+    // The input iterator is finished now, so `reader` is available again.
     for comment in comments {
         write_line(&mut writer, &comment)?;
     }
@@ -209,6 +242,12 @@ pub fn sort_gff<R: BufRead, W: Write>(reader: R, disk_sort: bool, mut writer: W)
 
     if !group.is_empty() {
         write_gff_group(&mut writer, &group)?;
+    }
+
+    // Everything after ##FASTA is opaque data. Don't parse or buffer it.
+    if let Some(fasta_line) = fasta_line {
+        writer.write_all(&fasta_line)?;
+        io::copy(&mut reader, &mut writer)?;
     }
 
     Ok(())

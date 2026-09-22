@@ -203,28 +203,36 @@ fn real_ecoli_gff_fixture_sorts_without_changing_record_count() {
 
 #[test]
 fn disk_sort_gff() {
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/random.gff.gz");
-    let mut output = Vec::new();
-    sort_file(&fixture, true, &mut output).expect("supplied GFF fixture should sort");
-    let output = lines(output);
-    let mut reader = MultiGzDecoder::new(
-        fs::File::open(Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/random_sorted.gff.gz"))
-            .expect("should open file"),
-    );
-    let mut expected = Vec::new();
-    reader.read_to_end(&mut expected).expect("should read");
-    let expected = lines(expected);
-    assert_eq!(
-        expected
-            .iter()
-            .filter(|line| !line.starts_with('#'))
-            .collect::<Vec<&String>>(),
-        output
-            .iter()
-            .filter(|line| !line.starts_with('#'))
-            .collect::<Vec<&String>>(),
-        "Sorted using disk does not match"
-    );
+    for (fixture_path, expected_path) in ["fixtures/random.gff.gz", "fixtures/random_fasta.gff.gz"]
+        .iter()
+        .zip([
+            "fixtures/random_sorted.gff.gz",
+            "fixtures/random_fasta_sorted.gff.gz",
+        ])
+    {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join(fixture_path);
+        let mut output = Vec::new();
+        sort_file(&fixture, true, &mut output).expect("supplied GFF fixture should sort");
+        let output = lines(output);
+        let mut reader = MultiGzDecoder::new(
+            fs::File::open(Path::new(env!("CARGO_MANIFEST_DIR")).join(expected_path))
+                .expect("should open file"),
+        );
+        let mut expected = Vec::new();
+        reader.read_to_end(&mut expected).expect("should read");
+        let expected = lines(expected);
+        assert_eq!(
+            expected
+                .iter()
+                .filter(|line| !line.starts_with('#'))
+                .collect::<Vec<&String>>(),
+            output
+                .iter()
+                .filter(|line| !line.starts_with('#'))
+                .collect::<Vec<&String>>(),
+            "Sorted using disk does not match"
+        );
+    }
 }
 
 #[test]
