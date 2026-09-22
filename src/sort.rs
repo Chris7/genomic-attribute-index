@@ -150,9 +150,7 @@ where
     T: Serialize + DeserializeOwned + Send + 'static,
     I: IntoIterator<Item = io::Result<T>>,
 {
-    // if disk_sort {
     let sorter: ExternalSorter<T, io::Error, LimitedBufferBuilder> = ExternalSorterBuilder::new()
-        .with_tmp_dir(Path::new("."))
         .with_buffer(LimitedBufferBuilder::new(
             if disk_sort {
                 SORT_CHUNK_RECORDS
@@ -169,13 +167,6 @@ where
     Ok(Box::new(
         records.map(|record| record.map_err(io::Error::other)),
     ))
-    // } else {
-    //     let mut records = records.into_iter().collect::<io::Result<Vec<_>>>()?;
-
-    //     records.sort_by(compare);
-
-    //     Ok(Box::new(records.into_iter().map(Ok::<_, io::Error>)))
-    // }
 }
 
 pub fn sort_gff<R: BufRead, W: Write>(reader: R, disk_sort: bool, mut writer: W) -> Result<()> {
