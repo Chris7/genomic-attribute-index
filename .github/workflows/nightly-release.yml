@@ -26,8 +26,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release delete nightly --yes --cleanup-tag || true
+          gh release delete nightly --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
           gh release create nightly \
+            --repo "$GITHUB_REPOSITORY" \
             --target "$NIGHTLY_SHA" \
             --prerelease \
             --title "Nightly" \
@@ -47,7 +48,7 @@ jobs:
       - name: Upload Rust package
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload nightly target/package/*.crate --clobber
+        run: gh release upload nightly target/package/*.crate --repo "$GITHUB_REPOSITORY" --clobber
 
   python-sdist:
     needs: create-release
@@ -70,7 +71,7 @@ jobs:
       - name: Upload Python source distribution
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload nightly dist/*.tar.gz --clobber
+        run: gh release upload nightly dist/*.tar.gz --repo "$GITHUB_REPOSITORY" --clobber
 
   python-wheel:
     needs: create-release
@@ -110,4 +111,4 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload nightly dist/*.whl --clobber
+        run: gh release upload nightly dist/*.whl --repo "$GITHUB_REPOSITORY" --clobber
