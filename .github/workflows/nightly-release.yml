@@ -34,9 +34,23 @@ jobs:
             --title "Nightly" \
             --notes "Nightly build from successful CI run ${{ github.event.workflow_run.id }}."
 
-  rust-package:
+  binary:
+    name: Build ${{ matrix.name }} binary
     needs: create-release
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-latest
+            executable: gai
+          - name: macOS
+            os: macos-latest
+            executable: gai
+          - name: Windows
+            os: windows-latest
+            executable: gai.exe
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -44,11 +58,12 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: nightly-2026-06-26
-      - run: cargo package --locked
-      - name: Upload Rust package
+      - run: cargo build --release --locked --bin gai
+      - name: Upload nightly binary
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload nightly target/package/*.crate --repo "$GITHUB_REPOSITORY" --clobber
+        shell: bash
+        run: gh release upload nightly "target/release/${{ matrix.executable }}" --repo "$GITHUB_REPOSITORY" --clobber
 
   python-sdist:
     needs: create-release
