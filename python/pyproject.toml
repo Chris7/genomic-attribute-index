@@ -27,3 +27,5 @@ module-name = "gai._gai"
 features = ["abi3", "extension-module"]
 compatibility = "pypi"
 data = "gai.data"
+include = [{ path = "gai.data/scripts/.gitkeep", format = "sdist" }]
+exclude = [{ path = "gai.data/scripts/.gitkeep", format = "wheel" }]

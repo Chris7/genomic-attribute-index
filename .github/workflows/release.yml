@@ -87,13 +87,33 @@ jobs:
           toolchain: nightly-2026-06-26
       - name: Verify Python lockfile before sdist
         run: cargo metadata --manifest-path python/Cargo.toml --locked --format-version 1 --no-deps
-      - name: Prepare Python package data directory
-        run: mkdir -p python/gai.data
       - uses: PyO3/maturin-action@86b9d133d34bc1b40018696f782949dac11bd380
         with:
           command: sdist
           maturin-version: v1.11.5
           args: --manifest-path python/Cargo.toml --out dist
+      - name: Verify source distribution contents
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import tarfile
+
+          archives = list(Path("dist").glob("*.tar.gz"))
+          if len(archives) != 1:
+              raise SystemExit(f"expected one source distribution, found {archives}")
+
+          with tarfile.open(archives[0], "r:gz") as archive:
+              members = archive.getnames()
+
+          required = ("gai.data", "scripts", ".gitkeep")
+          if not any(
+              len(member.split("/")) == 4 and tuple(member.split("/")[1:]) == required
+              for member in members
+          ):
+              raise SystemExit(f"source distribution is missing {required}: {members}")
+
+          print(f"verified {'/'.join(required)} at the sdist root in {archives[0]}")
+          PY
       - uses: actions/upload-artifact@v4
         with:
           name: python-sdist
