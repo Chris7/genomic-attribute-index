@@ -136,10 +136,10 @@ jobs:
           from pathlib import Path
           executable = "gai.exe" if os.name == "nt" else "gai"
           wheel = next(Path("dist").glob("*.whl"))
-          expected = f"gai.data/scripts/{executable}"
+          expected = f".data/scripts/{executable}"
           with zipfile.ZipFile(wheel) as archive:
-              if expected not in archive.namelist():
-                  raise SystemExit(f"wheel is missing {expected}: {wheel}")
+              if not any(path.endswith(expected) for path in archive.namelist()):
+                  raise SystemExit(f"wheel is missing *{expected}: {wheel}")
       - name: Upload Python wheel
         shell: bash
         env:
