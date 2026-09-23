@@ -69,6 +69,30 @@ jobs:
           key: ${{ runner.os }}-python-build-${{ hashFiles('Cargo.lock', 'python/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-python-build-
+
+      - name: Build gai binary
+        run: cargo build --release --locked --bin gai
+
+      - name: Stage gai binary for Python wheel
+        shell: python
+        run: |
+          import os
+          import shutil
+          from pathlib import Path
+
+          executable = "gai.exe" if os.name == "nt" else "gai"
+
+          source = Path("target/release") / executable
+          destination = Path("python/gai.data/scripts") / executable
+
+          if not source.is_file():
+              raise SystemExit(f"missing gai binary: {source}")
+
+          destination.parent.mkdir(parents=True, exist_ok=True)
+          shutil.copy2(source, destination)
+
+          print(f"staged {source} -> {destination}")
+
       - uses: PyO3/maturin-action@86b9d133d34bc1b40018696f782949dac11bd380
         with:
           command: build
