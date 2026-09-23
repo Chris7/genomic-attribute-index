@@ -41,15 +41,26 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: Linux
+          - name: Linux x86_64
             os: ubuntu-latest
             executable: gai
+            asset: gai.linux-x86_64.zip
+            format: zip
+          - name: Linux ARM64
+            os: ubuntu-24.04-arm
+            executable: gai
+            asset: gai.linux-arm64.zip
+            format: zip
           - name: macOS
             os: macos-latest
             executable: gai
+            asset: gai.macos.pkg
+            format: pkg
           - name: Windows
             os: windows-latest
             executable: gai.exe
+            asset: gai.windows-x86_64.zip
+            format: zip
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -59,11 +70,25 @@ jobs:
         with:
           toolchain: nightly-2026-06-26
       - run: cargo build --release --locked --bin gai
+      - name: Package nightly binary
+        shell: bash
+        run: |
+          mkdir -p package
+          if [ "${{ matrix.format }}" = "pkg" ]; then
+            pkgbuild \
+              --root target/release \
+              --identifier org.genomic-attribute-index.gai \
+              --version 0.0.0 \
+              --install-location /usr/local/bin \
+              "package/${{ matrix.asset }}"
+          else
+            7z a "package/${{ matrix.asset }}" "target/release/${{ matrix.executable }}"
+          fi
       - name: Upload nightly binary
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
-        run: gh release upload nightly "target/release/${{ matrix.executable }}" --repo "$GITHUB_REPOSITORY" --clobber
+        run: gh release upload nightly "package/${{ matrix.asset }}" --repo "$GITHUB_REPOSITORY" --clobber
 
   python-sdist:
     needs: create-release
