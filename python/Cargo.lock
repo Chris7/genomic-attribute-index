@@ -295,7 +295,7 @@ checksum = "7ab85b9b05e3978cc9a9cf8fea7f01b494e1a09ed3037e16ba39edc7a29eb61a"
 
 [[package]]
 name = "gai-python"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "genomic-attribute-index",
  "pyo3",
@@ -313,7 +313,7 @@ dependencies = [
 
 [[package]]
 name = "genomic-attribute-index"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "clap",
  "crc32fast",
