@@ -51,9 +51,14 @@ jobs:
           version=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name=="genomic-attribute-index") | .version' | head -n1)
           cargo set-version --manifest-path python/Cargo.toml "$version"
           old_version_pattern=${old_version//./\\.}
-          sed -E -i.bak "s/(genomic-attribute-index[[:space:]]*=[[:space:]]*[{][^}]*version[[:space:]]*=[[:space:]]*\")${old_version_pattern}(\")/\\1${version}\\2/g" python/Cargo.toml
-          uv version --directory python --no-sync "$version"
+          sed -E -i.bak "s#(^[[:space:]]*gai[[:space:]]*=[[:space:]]*[{][[:space:]]*package[[:space:]]*=[[:space:]]*\"genomic-attribute-index\",[[:space:]]*version[[:space:]]*=[[:space:]]*\")${old_version_pattern}(\")#\1${version}\2#" python/Cargo.toml
           rm -f python/Cargo.toml.bak
+          uv version --directory python --no-sync "$version"
+          dependency_req=$(cargo metadata --manifest-path python/Cargo.toml --format-version 1 --no-deps | jq -r '[.packages[] | select(.name=="gai-python") | .dependencies[] | select(.name=="genomic-attribute-index" and .rename=="gai")] | if length == 1 then .[0].req else "" end')
+          if [[ "$dependency_req" != "^${version}" ]]; then
+            echo "gai dependency requirement is ${dependency_req@Q}; expected ^${version}" >&2
+            exit 1
+          fi
           cargo update -p genomic-attribute-index
           cargo update --manifest-path python/Cargo.toml -p genomic-attribute-index
 

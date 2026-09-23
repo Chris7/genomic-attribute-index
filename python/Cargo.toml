@@ -17,7 +17,7 @@ abi3 = ["pyo3/abi3-py310"]
 extension-module = ["pyo3/extension-module"]
 
 [dependencies]
-gai = { package = "genomic-attribute-index", version = "0.1.0", path = ".." }
+gai = { package = "genomic-attribute-index", version = "0.1.2", path = ".." }
 pyo3 = { version = "0.25.1", features = ["multiple-pymethods"] }
 
 [workspace]

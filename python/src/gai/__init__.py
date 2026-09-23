@@ -18,6 +18,7 @@ from ._gai import (
     IndexMetadata,
     IndexedGff,
     QueryStats,
+    __version__ as _extension_version,
     build_index as _build_index,
     inspect_index as _inspect_index,
     open_index as _open_index,
@@ -49,8 +50,9 @@ try:
     __version__ = version("genomic-attribute-index")
 except PackageNotFoundError:
     # Source-tree imports before a wheel/editable install still expose a useful
-    # version; release metadata is checked against Cargo and pyproject.
-    __version__ = "0.1.0"
+    # version from the compiled extension, which is compiled from Cargo's
+    # package version.
+    __version__ = _extension_version
 
 
 def sort(input, output, *, disk_sort=False) -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gzip
+from importlib.metadata import version as distribution_version
 from pathlib import Path
 
 import pytest
@@ -9,7 +10,9 @@ import gai
 
 
 def test_distribution_version_is_exposed():
-    assert gai.__version__ == "0.1.0"
+    expected = distribution_version("genomic-attribute-index")
+    assert gai.__version__ == expected
+    assert gai._gai.__version__ == expected
 
 
 def _build(

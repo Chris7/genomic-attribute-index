@@ -56,12 +56,28 @@ jobs:
               "--format-version", "1", "--no-deps",
           ]))
           python_crate = next(package for package in python_metadata["packages"] if package["name"] == "gai-python")
+          dependency = next(
+              (
+                  dependency
+                  for dependency in python_crate["dependencies"]
+                  if dependency["name"] == "genomic-attribute-index"
+                  and dependency.get("rename") == "gai"
+              ),
+              None,
+          )
+          dependency_requirement = dependency["req"] if dependency else None
           pyproject = pathlib.Path("python/pyproject.toml").read_text()
           python_version = re.search(r'^version = "([^"]+)"$', pyproject, re.MULTILINE).group(1)
-          if root["version"] != expected or python_crate["version"] != expected or python_version != expected:
+          if (
+              root["version"] != expected
+              or python_crate["version"] != expected
+              or python_version != expected
+              or dependency_requirement != f"^{expected}"
+          ):
               raise SystemExit(
                   f"tag {expected!r} does not match Rust {root['version']!r}, "
-                  f"Python crate {python_crate['version']!r}, and Python {python_version!r}"
+                  f"Python crate {python_crate['version']!r}, and Python {python_version!r}; "
+                  f"gai dependency requirement is {dependency_requirement!r}"
               )
           PY
       - run: cargo build --locked --release --all-features

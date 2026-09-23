@@ -517,6 +517,7 @@ fn inspect_index(py: Python<'_>, gai: PathBuf) -> PyResult<PyIndexMetadata> {
 
 #[pymodule]
 fn _gai(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add("GaiError", m.py().get_type::<GaiError>())?;
     m.add("GaiInputError", m.py().get_type::<GaiInputError>())?;
     m.add("GaiIoError", m.py().get_type::<GaiIoError>())?;
