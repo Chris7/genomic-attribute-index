@@ -92,6 +92,8 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: nightly-2026-06-26
+      - name: Prepare Python package data directory
+        run: mkdir -p python/gai.data/scripts
       - name: Build gai binary
         run: cargo build --release --locked --bin gai
       - name: Stage gai binary for Python wheel
@@ -104,11 +106,25 @@ jobs:
           destination = Path("python/gai.data/scripts") / executable
           destination.parent.mkdir(parents=True, exist_ok=True)
           shutil.copy2(Path("target/release") / executable, destination)
+          if not destination.is_file():
+              raise SystemExit(f"missing staged executable: {destination}")
       - uses: PyO3/maturin-action@86b9d133d34bc1b40018696f782949dac11bd380
         with:
           command: build
           maturin-version: v1.11.5
           args: --manifest-path python/Cargo.toml --release --locked --features abi3,extension-module --compatibility pypi --out dist
+      - name: Verify wheel contains gai executable
+        shell: python
+        run: |
+          import os
+          import zipfile
+          from pathlib import Path
+          executable = "gai.exe" if os.name == "nt" else "gai"
+          wheel = next(Path("dist").glob("*.whl"))
+          expected = f"gai.data/scripts/{executable}"
+          with zipfile.ZipFile(wheel) as archive:
+              if expected not in archive.namelist():
+                  raise SystemExit(f"wheel is missing {expected}: {wheel}")
       - name: Upload Python wheel
         shell: bash
         env:
