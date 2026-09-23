@@ -1,0 +1,87 @@
+name: Versioned Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_type:
+        required: true
+        type: choice
+        description: "The semver bump level"
+        options:
+          - "patch"
+          - "minor"
+          - "major"
+        default: "patch"
+
+jobs:
+  versioned-release:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Install cargo-edit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-edit
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Configure git author
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Bump versions
+        env:
+          RELEASE_TYPE: ${{ inputs.release_type }}
+        run: |
+          old_version=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name=="genomic-attribute-index") | .version' | head -n1)
+          cargo set-version -p genomic-attribute-index --bump "$RELEASE_TYPE"
+          version=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name=="genomic-attribute-index") | .version' | head -n1)
+          cargo set-version --manifest-path python/Cargo.toml "$version"
+          old_version_pattern=${old_version//./\\.}
+          sed -E -i.bak "s/(genomic-attribute-index[[:space:]]*=[[:space:]]*[{][^}]*version[[:space:]]*=[[:space:]]*\")${old_version_pattern}(\")/\\1${version}\\2/g" python/Cargo.toml
+          uv version --directory python --no-sync "$version"
+          rm -f python/Cargo.toml.bak
+          cargo update -p genomic-attribute-index
+          cargo update --manifest-path python/Cargo.toml -p genomic-attribute-index
+
+      - name: Capture new version
+        id: version
+        run: |
+          version=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name=="genomic-attribute-index") | .version' | head -n1)
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Commit, tag, and push
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          git add Cargo.toml python/Cargo.toml python/pyproject.toml
+          git add Cargo.lock python/Cargo.lock
+          git commit -m "Release v${VERSION}"
+          git tag -a "v${VERSION}" -m "Release v${VERSION}"
+          git push origin HEAD
+          git push origin "v${VERSION}"
+
+      - name: Generate release
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "v${VERSION}" --title "v${VERSION}" --notes "genomic-attribute-index ${VERSION}"
+
+      - name: Build release artifacts
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run release.yml --ref "v${VERSION}" -f tag="v${VERSION}" -f publish=false

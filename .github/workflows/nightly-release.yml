@@ -1,0 +1,113 @@
+name: Nightly Release
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nightly-release
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  NIGHTLY_SHA: ${{ github.event.workflow_run.head_sha }}
+
+jobs:
+  create-release:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Replace nightly release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete nightly --yes --cleanup-tag || true
+          gh release create nightly \
+            --target "$NIGHTLY_SHA" \
+            --prerelease \
+            --title "Nightly" \
+            --notes "Nightly build from successful CI run ${{ github.event.workflow_run.id }}."
+
+  rust-package:
+    needs: create-release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.NIGHTLY_SHA }}
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-06-26
+      - run: cargo package --locked
+      - name: Upload Rust package
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload nightly target/package/*.crate --clobber
+
+  python-sdist:
+    needs: create-release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.NIGHTLY_SHA }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-06-26
+      - uses: PyO3/maturin-action@86b9d133d34bc1b40018696f782949dac11bd380
+        with:
+          command: sdist
+          maturin-version: v1.11.5
+          args: --manifest-path python/Cargo.toml --out dist
+      - name: Upload Python source distribution
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload nightly dist/*.tar.gz --clobber
+
+  python-wheel:
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-15-intel, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.NIGHTLY_SHA }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-06-26
+      - name: Build gai binary
+        run: cargo build --release --locked --bin gai
+      - name: Stage gai binary for Python wheel
+        shell: python
+        run: |
+          import os
+          import shutil
+          from pathlib import Path
+          executable = "gai.exe" if os.name == "nt" else "gai"
+          destination = Path("python/gai.data/scripts") / executable
+          destination.parent.mkdir(parents=True, exist_ok=True)
+          shutil.copy2(Path("target/release") / executable, destination)
+      - uses: PyO3/maturin-action@86b9d133d34bc1b40018696f782949dac11bd380
+        with:
+          command: build
+          maturin-version: v1.11.5
+          args: --manifest-path python/Cargo.toml --release --locked --features abi3,extension-module --compatibility pypi --out dist
+      - name: Upload Python wheel
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload nightly dist/*.whl --clobber
