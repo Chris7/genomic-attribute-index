@@ -87,6 +87,8 @@ jobs:
           toolchain: nightly-2026-06-26
       - name: Verify Python lockfile before sdist
         run: cargo metadata --manifest-path python/Cargo.toml --locked --format-version 1 --no-deps
+      - name: Prepare Python package data directory
+        run: mkdir -p python/gai.data
       - uses: PyO3/maturin-action@86b9d133d34bc1b40018696f782949dac11bd380
         with:
           command: sdist
