@@ -1,6 +1,6 @@
 [package]
 name = "gai-python"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Python bindings for the Genomic Attribute Index"
 repository = "https://github.com/Chris7/genomic-attribute-index"
