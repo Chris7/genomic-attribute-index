@@ -116,6 +116,89 @@ fn cli_index_query_and_inspect() {
         "chr1\tsrc\tgene\t10\t20\t.\t+\t.\tName=BRCA1;Alias=BRCC1"
     );
 
+    let contains = Command::new(binary)
+        .args([
+            "query-index",
+            &source,
+            "RCA",
+            "--match",
+            "contains",
+            "--coordinate-index",
+            &coordinate_index,
+            "--gai",
+            &destination_string,
+        ])
+        .output()
+        .expect("should run contains query");
+    assert!(contains.status.success(), "stderr: {:?}", contains.stderr);
+    assert_eq!(
+        String::from_utf8_lossy(&contains.stdout).trim(),
+        "chr1\tsrc\tgene\t10\t20\t.\t+\t.\tName=BRCA1;Alias=BRCC1"
+    );
+
+    let regex = Command::new(binary)
+        .args([
+            "query-index",
+            &source,
+            "^(BRCA[0-9]|Other Gene)$",
+            "--match",
+            "regex",
+            "--coordinate-index",
+            &coordinate_index,
+            "--gai",
+            &destination_string,
+        ])
+        .output()
+        .expect("should run regex query");
+    assert!(regex.status.success(), "stderr: {:?}", regex.stderr);
+    assert_eq!(
+        String::from_utf8_lossy(&regex.stdout).trim(),
+        "chr1\tsrc\tgene\t10\t20\t.\t+\t.\tName=BRCA1;Alias=BRCC1\nchr1\tsrc\tgene\t100\t110\t.\t-\t.\tName=Other%20Gene"
+    );
+
+    let uppercase_escape = Command::new(binary)
+        .args([
+            "query-index",
+            &source,
+            r"\S",
+            "--match",
+            "regex",
+            "--coordinate-index",
+            &coordinate_index,
+            "--gai",
+            &destination_string,
+        ])
+        .output()
+        .expect("should preserve uppercase regex escapes");
+    assert!(
+        uppercase_escape.status.success(),
+        "stderr: {:?}",
+        uppercase_escape.stderr
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&uppercase_escape.stdout)
+            .lines()
+            .count(),
+        2
+    );
+
+    let invalid_regex = Command::new(binary)
+        .args([
+            "query-index",
+            &source,
+            "no-match[",
+            "--match",
+            "regex",
+            "--coordinate-index",
+            &coordinate_index,
+            "--gai",
+            &destination_string,
+        ])
+        .output()
+        .expect("should reject invalid regex even with no matching term");
+    assert!(!invalid_regex.status.success());
+    assert!(String::from_utf8_lossy(&invalid_regex.stderr).contains("invalid regex"));
+
     let invalid_match = Command::new(binary)
         .args([
             "query-index",
@@ -174,4 +257,66 @@ fn cli_index_query_and_inspect() {
         .output()
         .expect("should run removed command check");
     assert!(!old_surface.status.success());
+}
+
+#[test]
+fn cli_bed_index_query_supports_all_match_modes() {
+    let directory = tempdir().expect("should create temp directory");
+    let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/sorting");
+    let source = fixture_dir.join("ecoli_k12_mg1655.bed.gz");
+    let coordinate_index = fixture_dir.join("ecoli_k12_mg1655.bed.gz.tbi");
+    let destination = directory.path().join("fixture-bed.gai");
+    let binary = env!("CARGO_BIN_EXE_gai");
+    let source = source.to_string_lossy().into_owned();
+    let coordinate_index = coordinate_index.to_string_lossy().into_owned();
+    let destination = destination.to_string_lossy().into_owned();
+
+    let indexed = Command::new(binary)
+        .args([
+            "build-index",
+            &source,
+            "--attribute",
+            "ignored",
+            "--coordinate-index",
+            &coordinate_index,
+            "--output",
+            &destination,
+        ])
+        .output()
+        .expect("should build BED name index");
+    assert!(indexed.status.success(), "stderr: {:?}", indexed.stderr);
+
+    let query = |term: &str, mode: Option<&str>| {
+        let mut command = Command::new(binary);
+        command.args([
+            "query-index",
+            &source,
+            term,
+            "--coordinate-index",
+            &coordinate_index,
+            "--gai",
+            &destination,
+        ]);
+        if let Some(mode) = mode {
+            command.args(["--match", mode]);
+        }
+        command.output().expect("should query BED names")
+    };
+
+    let exact = query("thrL", None);
+    assert!(exact.status.success(), "stderr: {:?}", exact.stderr);
+    assert_eq!(String::from_utf8_lossy(&exact.stdout).lines().count(), 1);
+    assert!(String::from_utf8_lossy(&exact.stdout).contains("\tthrL\t"));
+
+    let prefix = query("thr", Some("prefix"));
+    assert!(prefix.status.success(), "stderr: {:?}", prefix.stderr);
+    assert!(String::from_utf8_lossy(&prefix.stdout).lines().count() >= 4);
+
+    let contains = query("hr", Some("contains"));
+    assert!(contains.status.success(), "stderr: {:?}", contains.stderr);
+    assert!(String::from_utf8_lossy(&contains.stdout).contains("\tthrL\t"));
+
+    let regex = query("^thr[ABCL]$", Some("regex"));
+    assert!(regex.status.success(), "stderr: {:?}", regex.stderr);
+    assert_eq!(String::from_utf8_lossy(&regex.stdout).lines().count(), 4);
 }

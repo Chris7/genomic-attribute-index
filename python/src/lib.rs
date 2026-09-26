@@ -395,7 +395,8 @@ impl PyIndexedSource {
         Ok(guard.metadata().clone().into())
     }
 
-    /// Query one normalized configured attribute value.
+    /// Query configured values exactly, by prefix, by literal substring, or by regex.
+    /// Regex syntax is preserved and patterns are Unicode-aware searches.
     #[pyo3(signature = (term, *, r#match = "exact"))]
     fn query(&self, py: Python<'_>, term: &str, r#match: &str) -> PyResult<Vec<PyGffRecord>> {
         let term = term.to_owned();

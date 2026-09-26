@@ -2,7 +2,7 @@ from pathlib import Path
 from typing import Iterable, Literal, Optional, Union
 
 PathLike = Union[str, Path]
-MatchMode = Literal["exact", "prefix"]
+MatchMode = Literal["exact", "prefix", "contains", "regex"]
 __version__: str
 
 class GaiError(Exception): ...

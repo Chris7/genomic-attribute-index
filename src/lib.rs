@@ -25,7 +25,7 @@ use std::{
 };
 
 use bgzf::io::Seek as _;
-use fst::Automaton;
+use fst::{Automaton, Streamer};
 use memmap2::Mmap;
 use noodles::{
     bgzf,
@@ -39,6 +39,7 @@ use noodles::{
     },
     gff, tabix,
 };
+use regex::{Regex, RegexBuilder};
 use sha2::{Digest, Sha256};
 
 mod sort;
@@ -90,15 +91,19 @@ pub enum Error {
     InvalidCoordinate,
 }
 
-/// Controls how a normalized attribute query is matched against indexed
-/// values.
+/// Controls how a normalized annotation query is matched against indexed
+/// terms.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MatchMode {
-    /// Match one complete normalized configured attribute value.
+    /// Match one complete normalized configured value.
     Exact,
-    /// Match every normalized configured attribute value beginning with the
-    /// normalized query.
+    /// Match every normalized value beginning with the normalized query.
     Prefix,
+    /// Match normalized values containing the query as a literal substring.
+    Contains,
+    /// Search normalized values with a regular expression. The regex engine
+    /// uses Unicode-aware case folding when the index is case-insensitive.
+    Regex,
 }
 
 impl MatchMode {
@@ -107,9 +112,54 @@ impl MatchMode {
         match value {
             "exact" => Ok(Self::Exact),
             "prefix" => Ok(Self::Prefix),
+            "contains" => Ok(Self::Contains),
+            "regex" => Ok(Self::Regex),
             _ => Err(Error::InvalidInput(
-                "match must be either 'exact' or 'prefix'".into(),
+                "match must be one of 'exact', 'prefix', 'contains', or 'regex'".into(),
             )),
+        }
+    }
+}
+
+enum CompiledMatch {
+    Exact(String),
+    Prefix(String),
+    Contains(String),
+    Regex { pattern: String, regex: Regex },
+}
+
+impl CompiledMatch {
+    fn new(term: &str, mode: MatchMode, case_sensitive: bool) -> Result<Self> {
+        match mode {
+            MatchMode::Exact => Ok(Self::Exact(normalize_value(term, case_sensitive))),
+            MatchMode::Prefix => Ok(Self::Prefix(normalize_value(term, case_sensitive))),
+            MatchMode::Contains => Ok(Self::Contains(normalize_value(term, case_sensitive))),
+            MatchMode::Regex => {
+                let pattern = term.trim_matches(char::is_whitespace).to_owned();
+                let regex = RegexBuilder::new(&pattern)
+                    .case_insensitive(!case_sensitive)
+                    .build()
+                    .map_err(|error| {
+                        Error::InvalidInput(format!("invalid regex query: {error}"))
+                    })?;
+                Ok(Self::Regex { pattern, regex })
+            }
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Exact(query) | Self::Prefix(query) | Self::Contains(query) => query.is_empty(),
+            Self::Regex { pattern, .. } => pattern.is_empty(),
+        }
+    }
+
+    fn matches_normalized(&self, value: &str) -> bool {
+        match self {
+            Self::Exact(query) => value == query,
+            Self::Prefix(query) => value.starts_with(query),
+            Self::Contains(query) => value.contains(query),
+            Self::Regex { regex, .. } => regex.is_match(value),
         }
     }
 }
@@ -940,8 +990,7 @@ fn feature_record_matches_term<R>(
     record: &R,
     configured_attributes: &HashSet<String>,
     case_sensitive: bool,
-    normalized_query: &str,
-    match_mode: MatchMode,
+    matcher: &CompiledMatch,
 ) -> Result<bool>
 where
     R: gff::feature::Record + ?Sized,
@@ -961,11 +1010,7 @@ where
             let value = std::str::from_utf8(value.as_ref())
                 .map_err(|_| Error::InvalidInput("GFF attribute value is not UTF-8".into()))?;
             let normalized_value = normalize_value(value, case_sensitive);
-            let matches = match match_mode {
-                MatchMode::Exact => normalized_value == normalized_query,
-                MatchMode::Prefix => normalized_value.starts_with(normalized_query),
-            };
-            if matches {
+            if matcher.matches_normalized(&normalized_value) {
                 return Ok(true);
             }
         }
@@ -3365,9 +3410,9 @@ impl NameIndexReader {
     }
 
     /// Looks up a normalized term using the requested match mode and returns
-    /// its coordinate-ordered spans. Prefix matching streams matching keys
-    /// directly from the immutable FST and decodes each referenced postings
-    /// block at most once.
+    /// its coordinate-ordered spans. Prefix matching uses the FST automaton;
+    /// contains and regex matching scan keys incrementally. Each referenced
+    /// postings block is decoded at most once.
     pub fn lookup_spans_with_mode(&self, term: &str, mode: MatchMode) -> Result<Vec<Span>> {
         let (span_ids, _) = self.lookup_span_ids_with_mode_and_stats(term, mode)?;
         self.resolve_span_ids(&span_ids)
@@ -3416,19 +3461,38 @@ impl NameIndexReader {
         term: &str,
         mode: MatchMode,
     ) -> Result<(Vec<u64>, u64)> {
-        let normalized = normalize_value(term, self.metadata.case_sensitive);
-        if normalized.is_empty() {
+        let matcher = CompiledMatch::new(term, mode, self.metadata.case_sensitive)?;
+        self.lookup_span_ids_with_matcher_and_stats(&matcher)
+    }
+
+    fn lookup_span_ids_with_matcher_and_stats(
+        &self,
+        matcher: &CompiledMatch,
+    ) -> Result<(Vec<u64>, u64)> {
+        if matcher.is_empty() {
             return Ok((Vec::new(), 0));
         }
         let terms_section = self.section(SectionKind::Terms)?;
         let term_map = fst::Map::new(terms_section)
             .map_err(|error| Error::Corrupt(format!("invalid term FST: {error}")))?;
-        let locators = match mode {
-            MatchMode::Exact => term_map.get(normalized).into_iter().collect(),
-            MatchMode::Prefix => fst::IntoStreamer::into_stream(
-                term_map.search(fst::automaton::Str::new(&normalized).starts_with()),
+        let locators = match matcher {
+            CompiledMatch::Exact(query) => term_map.get(query).into_iter().collect(),
+            CompiledMatch::Prefix(query) => fst::IntoStreamer::into_stream(
+                term_map.search(fst::automaton::Str::new(query).starts_with()),
             )
             .into_values(),
+            CompiledMatch::Contains(_) | CompiledMatch::Regex { .. } => {
+                let mut locators = Vec::new();
+                let mut stream = term_map.stream();
+                while let Some((key, locator)) = stream.next() {
+                    let key = std::str::from_utf8(key)
+                        .map_err(|_| Error::Corrupt("term FST key is not UTF-8".into()))?;
+                    if matcher.matches_normalized(key) {
+                        locators.push(locator);
+                    }
+                }
+                locators
+            }
         };
         if locators.is_empty() {
             return Ok((Vec::new(), 0));
@@ -4166,10 +4230,13 @@ impl IndexedSource {
         self.query_name_with_mode_and_stats(term, MatchMode::Exact)
     }
 
-    /// Queries a configured attribute value or BED name using an explicit match mode.
-    /// Prefix mode streams every indexed value beginning with the normalized
-    /// query from the FST, unions their spans, and uses the same batched
-    /// TBI/CSI retrieval as exact queries.
+    /// Queries a configured GFF3 attribute value or BED name using an
+    /// explicit match mode.
+    /// Prefix mode streams matching FST keys through its prefix automaton;
+    /// contains and regex modes scan keys incrementally. Matching spans are
+    /// unioned and retrieved through the same batched TBI/CSI path. Regex
+    /// patterns are unanchored searches by default, preserve regex syntax,
+    /// and use Unicode-aware case folding for case-insensitive indexes.
     pub fn query_name_with_mode(
         &mut self,
         term: &str,
@@ -4186,13 +4253,15 @@ impl IndexedSource {
         term: &str,
         match_mode: MatchMode,
     ) -> Result<(Vec<GffRecord>, QueryStats)> {
-        let normalized_query = normalize_value(term, self.name_index.metadata.case_sensitive);
-        if normalized_query.is_empty() {
+        let matcher =
+            CompiledMatch::new(term, match_mode, self.name_index.metadata.case_sensitive)?;
+        if matcher.is_empty() {
             return Ok((Vec::new(), QueryStats::default()));
         }
         let span_ids = self
             .name_index
-            .lookup_span_ids_with_mode(&normalized_query, match_mode)?;
+            .lookup_span_ids_with_matcher_and_stats(&matcher)?
+            .0;
         let mut stats = QueryStats {
             requested_spans: span_ids.len() as u64,
             ..QueryStats::default()
@@ -4250,8 +4319,7 @@ impl IndexedSource {
             reference_ids: &self.reference_ids,
             configured_terms: &self.configured_terms,
             case_sensitive: self.name_index.metadata.case_sensitive,
-            normalized_query: &normalized_query,
-            match_mode,
+            matcher: &matcher,
         };
         let records = read_query_chunks(
             &self.source_path,
@@ -4296,8 +4364,7 @@ struct QueryReadContext<'a> {
     reference_ids: &'a HashMap<String, u32>,
     configured_terms: &'a HashSet<String>,
     case_sensitive: bool,
-    normalized_query: &'a str,
-    match_mode: MatchMode,
+    matcher: &'a CompiledMatch,
 }
 
 fn read_query_chunks(
@@ -4356,8 +4423,7 @@ fn read_gff_query_chunks(
                 &record,
                 context.configured_terms,
                 context.case_sensitive,
-                context.normalized_query,
-                context.match_mode,
+                context.matcher,
             )? {
                 continue;
             }
@@ -4425,10 +4491,7 @@ fn read_bed_query_chunks(
             let matches = extracted
                 .terms
                 .iter()
-                .any(|value| match context.match_mode {
-                    MatchMode::Exact => value == context.normalized_query,
-                    MatchMode::Prefix => value.starts_with(context.normalized_query),
-                });
+                .any(|value| context.matcher.matches_normalized(value));
             if !matches {
                 continue;
             }
@@ -4759,6 +4822,40 @@ mod tests {
                 .unwrap(),
             vec![0]
         );
+        assert_eq!(
+            reader
+                .lookup_span_ids_with_mode(" RCA ", MatchMode::Contains)
+                .unwrap(),
+            vec![0, 2]
+        );
+        assert_eq!(
+            reader
+                .lookup_span_ids_with_mode("^brc(a1|c1)$", MatchMode::Regex)
+                .unwrap(),
+            vec![0, 2]
+        );
+        assert_eq!(
+            reader
+                .lookup_span_ids_with_mode(r"^brc[a-z][0-9]$", MatchMode::Regex)
+                .unwrap(),
+            vec![0, 2]
+        );
+        assert_eq!(
+            reader
+                .lookup_span_ids_with_mode(r"\S", MatchMode::Regex)
+                .unwrap(),
+            vec![0, 1, 2]
+        );
+        assert!(
+            reader
+                .lookup_span_ids_with_mode("", MatchMode::Contains)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(matches!(
+            reader.lookup_span_ids_with_mode("missing[", MatchMode::Regex),
+            Err(Error::InvalidInput(message)) if message.contains("regex")
+        ));
         assert_eq!(reader.resolve_span_id(0).unwrap().start, 99);
         assert_eq!(reader.resolve_span_id(0).unwrap().length, 51);
         assert!(
@@ -4792,6 +4889,28 @@ mod tests {
                 fixture_records()[5]
             ]
         );
+        let (contains_records, contains_stats) = indexed
+            .query_name_with_mode_and_stats(" RCA ", MatchMode::Contains)
+            .expect("should query literal substring");
+        assert_eq!(contains_records.len(), 3);
+        assert_eq!(contains_stats.requested_spans, 2);
+        assert_eq!(contains_stats.exact_interval_queries, 2);
+        assert_eq!(contains_stats.matching_records, 3);
+        let (regex_records, regex_stats) = indexed
+            .query_name_with_mode_and_stats("^BR C[A-Z]$", MatchMode::Regex)
+            .expect("should query regex");
+        assert!(regex_records.is_empty());
+        assert_eq!(regex_stats.requested_spans, 0);
+        let (regex_records, regex_stats) = indexed
+            .query_name_with_mode_and_stats("^BRC(A1|C1)$", MatchMode::Regex)
+            .expect("should query anchored regex alternation");
+        assert_eq!(regex_records.len(), 3);
+        assert_eq!(regex_stats.requested_spans, 2);
+        assert_eq!(regex_stats.matching_records, 3);
+        let (escape_records, _) = indexed
+            .query_name_with_mode_and_stats(r"\S", MatchMode::Regex)
+            .expect("should preserve uppercase regex escape");
+        assert_eq!(escape_records.len(), 4);
         assert!(indexed.query_name("missing").unwrap().is_empty());
         assert!(
             indexed
@@ -4835,7 +4954,7 @@ mod tests {
         let case_options = NameIndexOptions::new(["Ignored"], true).unwrap();
         build_name_index(&source, &coordinate_index, &case_destination, &case_options)
             .expect("should build case-sensitive BED GAI");
-        let case_reader = NameIndexReader::open(case_destination).unwrap();
+        let case_reader = NameIndexReader::open(&case_destination).unwrap();
         assert_eq!(case_reader.lookup_span_ids("Alpha").unwrap(), vec![0, 2]);
         assert!(case_reader.lookup_span_ids("alpha").unwrap().is_empty());
 
@@ -4859,6 +4978,59 @@ mod tests {
             .query_name_with_mode("al", MatchMode::Prefix)
             .expect("should query BED name prefix");
         assert_eq!(prefix.len(), 2);
+
+        let (contains, contains_stats) = indexed
+            .query_name_with_mode_and_stats(" ph ", MatchMode::Contains)
+            .expect("should query BED name substring");
+        assert_eq!(contains.len(), 2);
+        assert_eq!(contains_stats.requested_spans, 2);
+        assert_eq!(contains_stats.matching_records, 2);
+
+        let (regex, regex_stats) = indexed
+            .query_name_with_mode_and_stats("^(ALPHA|BETA)$", MatchMode::Regex)
+            .expect("should query BED name regex");
+        assert_eq!(regex.len(), 3);
+        assert_eq!(regex_stats.matching_records, 3);
+        let (class_regex, _) = indexed
+            .query_name_with_mode_and_stats("^ALP[A-Z]+$", MatchMode::Regex)
+            .expect("should query BED regex character class");
+        assert_eq!(class_regex.len(), 2);
+        let (escape_regex, _) = indexed
+            .query_name_with_mode_and_stats(r"\S", MatchMode::Regex)
+            .expect("should preserve BED regex uppercase escape");
+        assert_eq!(escape_regex.len(), 3);
+        assert!(
+            indexed
+                .query_name_with_mode("^missing$", MatchMode::Regex)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(matches!(
+            indexed.query_name_with_mode("missing[", MatchMode::Regex),
+            Err(Error::InvalidInput(message)) if message.contains("regex")
+        ));
+
+        let mut case_indexed = IndexedSource::open(&source, &coordinate_index, &case_destination)
+            .expect("should open case-sensitive BED GAI");
+        assert_eq!(
+            case_indexed
+                .query_name_with_mode("^Alpha$", MatchMode::Regex)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(
+            case_indexed
+                .query_name_with_mode("^alpha$", MatchMode::Regex)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            case_indexed
+                .query_name_with_mode("PH", MatchMode::Contains)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -4886,6 +5058,18 @@ mod tests {
         assert_eq!(
             reader
                 .lookup_span_ids_with_mode("BR", MatchMode::Prefix)
+                .unwrap(),
+            vec![0, 2]
+        );
+        assert!(
+            reader
+                .lookup_span_ids_with_mode("^brca1$", MatchMode::Regex)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            reader
+                .lookup_span_ids_with_mode("^BRCA1$", MatchMode::Regex)
                 .unwrap(),
             vec![0, 2]
         );
@@ -5380,6 +5564,39 @@ mod tests {
     }
 
     #[test]
+    fn test_contains_filters_nonmatching_records_at_a_shared_span() {
+        let directory = tempdir().expect("should create temporary directory");
+        let matching = "chr1\tsrc\tgene\t10\t20\t.\t+\t.\tName=Alpha";
+        let nonmatching = "chr1\tsrc\tgene\t10\t20\t.\t+\t.\tName=Beta";
+        let (source, coordinate_index) = write_tbi_lines(
+            directory.path(),
+            "contains-shared-span",
+            &["##gff-version 3", matching, nonmatching],
+        );
+        let destination = directory.path().join("contains-shared-span.gai");
+        build_name_index(
+            &source,
+            &coordinate_index,
+            &destination,
+            &NameIndexOptions::new(["Name"], false).unwrap(),
+        )
+        .expect("should build shared-span GAI");
+
+        let mut indexed = IndexedSource::open(&source, &coordinate_index, &destination)
+            .expect("should open shared-span GAI");
+        let (records, stats) = indexed
+            .query_name_with_mode_and_stats("ph", MatchMode::Contains)
+            .expect("should query interior substring");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].raw_line, matching);
+        assert_eq!(stats.requested_spans, 1);
+        assert_eq!(stats.distinct_span_blocks_decoded, 1);
+        assert_eq!(stats.exact_interval_queries, 1);
+        assert_eq!(stats.unique_candidate_records, 2);
+        assert_eq!(stats.matching_records, 1);
+    }
+
+    #[test]
     fn test_query_chunk_union_and_virtual_position_deduplication() {
         let merged = merge_query_chunks(vec![
             Chunk::new(
@@ -5440,13 +5657,13 @@ mod tests {
         let duplicated_chunks = [chunks[0], chunks[0]];
         let mut stats = QueryStats::default();
         let requested_spans = spans.into_iter().collect::<HashSet<_>>();
+        let matcher = CompiledMatch::new("dedup", MatchMode::Exact, false).unwrap();
         let context = QueryReadContext {
             requested_spans: &requested_spans,
             reference_ids: &reference_ids,
             configured_terms: &configured_attributes,
             case_sensitive: false,
-            normalized_query: "dedup",
-            match_mode: MatchMode::Exact,
+            matcher: &matcher,
         };
         let records = read_query_chunks(
             &source,

@@ -45,7 +45,7 @@ __all__ = [
     "sort",
 ]
 
-MatchMode = Literal["exact", "prefix"]
+MatchMode = Literal["exact", "prefix", "contains", "regex"]
 try:
     __version__ = version("genomic-attribute-index")
 except PackageNotFoundError:
@@ -75,11 +75,13 @@ def build_index(
     compression_threads=None,
     bgzf_threads=None,
 ) -> BuildStats:
-    """Build a GAI beside a BGZF or plain GFF3 source.
+    """Build a GAI beside a BGZF or plain GFF3 source, or a BGZF BED source.
 
-    ``attributes`` is a nonempty iterable of explicit GFF3 attribute tags.
-    Duplicate tags are removed while preserving first occurrence. The result
-    contains deterministic build counters and phase timings.
+    For GFF3, ``attributes`` is a nonempty iterable of explicit attribute
+    tags. For BED, names from column 4 are indexed and ``attributes`` is
+    ignored. Duplicate GFF3 tags are removed while preserving first
+    occurrence. The result contains deterministic build counters and phase
+    timings.
     """
     return _build_index(
         input,
@@ -101,10 +103,13 @@ def open_index(input, coordinate_index, gai) -> IndexedSource:
 def query_index(
     input, coordinate_index, gai, term: str, *, match: MatchMode = "exact"
 ) -> list[GffRecord]:
-    """Open an indexed source and return records matching ``term``.
+    """Open an indexed GFF3 or BED source and return records matching ``term``.
 
-    ``match`` is either ``"exact"`` (the default) or ``"prefix"``. Values
-    are normalized before the selected comparison is applied.
+    ``match`` accepts ``"exact"`` (the default), ``"prefix"``,
+    ``"contains"`` for literal substring matching, or ``"regex"`` for a
+    Unicode-aware regular expression search. GFF3 attribute values or BED
+    column-4 names are normalized before matching; regex syntax is preserved
+    and the pattern is trimmed only at its boundaries.
     """
     return _query_index(input, coordinate_index, gai, term, match=match)
 

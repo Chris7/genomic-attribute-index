@@ -125,8 +125,13 @@ fn malformed_rows_are_actionable() {
 #[test]
 fn real_ecoli_bed_fixture_can_be_reordered_and_sorted() {
     let fixture =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/sorting/ecoli_k12_mg1655.bed");
-    let source = fs::read_to_string(&fixture).expect("real BED fixture should exist");
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/sorting/ecoli_k12_mg1655.bed.gz");
+    let mut decoder =
+        MultiGzDecoder::new(fs::File::open(&fixture).expect("real BED fixture exists"));
+    let mut source = String::new();
+    decoder
+        .read_to_string(&mut source)
+        .expect("real BED fixture should decompress");
     let mut fixture_lines = source.lines().collect::<Vec<_>>();
     assert!(fixture_lines.len() > 100);
     let last = fixture_lines.len() - 1;

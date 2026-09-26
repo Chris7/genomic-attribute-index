@@ -77,7 +77,7 @@ struct QueryIndexArgs {
     /// Explicit GAI path. Defaults to <input>.gai.
     #[arg(long)]
     gai: Option<PathBuf>,
-    /// Match complete values exactly or stream values beginning with the query.
+    /// Match values exactly, by prefix, by literal substring, or with a regex.
     #[arg(long = "match", value_enum, default_value_t = QueryMatch::Exact)]
     match_mode: QueryMatch,
 }
@@ -86,6 +86,8 @@ struct QueryIndexArgs {
 enum QueryMatch {
     Exact,
     Prefix,
+    Contains,
+    Regex,
 }
 
 impl From<QueryMatch> for MatchMode {
@@ -93,6 +95,8 @@ impl From<QueryMatch> for MatchMode {
         match value {
             QueryMatch::Exact => Self::Exact,
             QueryMatch::Prefix => Self::Prefix,
+            QueryMatch::Contains => Self::Contains,
+            QueryMatch::Regex => Self::Regex,
         }
     }
 }

@@ -30,7 +30,8 @@ of the application.
 
 We have designed for speed and compressibility of the attribute index. Because a GFF can be so feature
 rich, it makes little sense to have an index whose size is similar to a compressed GFF. This influences our
-decisions around things such as attributes can be looked up by prefix or exact matches only.
+decisions around things such as attributes can be looked up exactly, by prefix, by literal
+substring, or with a regular expression.
 
 ## Example commands
 
@@ -39,6 +40,8 @@ $ gai build-index annotations.gff3.gz \
     --attribute Name --attribute Alias --attribute gene_name
 $ gai query-index annotations.gff3.gz BRCA1
 $ gai query-index annotations.gff3.gz BRCA --match prefix
+$ gai query-index annotations.gff3.gz RCA --match contains
+$ gai query-index annotations.gff3.gz '^BRCA[0-9]+$' --match regex
 $ gai inspect-index annotations.gff3.gz.gai
 $ gai sort annotations.gff3 > annotations.sorted.gff3
 $ gai sort annotations.bed > annotations.sorted.bed
@@ -67,8 +70,15 @@ For advanced control `--memory-budget`, `--compression-threads`, and
 
 ## Querying
 
-Queries use exact normalized value matching by default. Passing `--match prefix` can be used to match based
-on prefix. No substring or fuzzy matching is currently available.
+Queries use exact normalized value matching by default. `--match prefix` matches values beginning
+with the query, and `--match contains` matches a literal substring anywhere in a value. Regex mode
+uses an unanchored Unicode-aware regular expression search; `^` and `$` can anchor a full-value
+match. Regex syntax is preserved, so escapes such as `\S` and `\D` retain their meaning. In a
+case-insensitive index, regex matching uses the regex engine's Unicode case folding, while indexed
+values continue to use GAI's ASCII-only lowercasing normalization. Query boundary whitespace is
+trimmed, and an empty query returns no results. Contains and regex queries scan the distinct indexed
+terms incrementally; exact and prefix queries retain their direct FST lookup paths. Existing indexes
+work with the new modes without rebuilding.
 
 ## Sorting
 
@@ -90,6 +100,9 @@ records on stdout. Library callers can use `BuildOptions` and its optional
 progress callback without any library-level stderr output.
 
 ## Benchmarks
+
+See [benchmarking documentation](docs/benchmarking.md) for the reproducible script and query-mode
+comparisons across GFF3 and BED indexes.
 
 All files are in compressed bgzip format.
 
@@ -128,6 +141,10 @@ indexed = gai.open_index(source, tbi, Path("annotations.gff3.gz.gai"))
 for record in indexed.query("BRCA1"):  # exact is the default
     print(record.reference_sequence_name, record.start, record.attributes)
 for record in indexed.query("BRCA", match="prefix"):
+    print(record.reference_sequence_name, record.start, record.attributes)
+for record in indexed.query("RCA", match="contains"):
+    print(record.reference_sequence_name, record.start, record.attributes)
+for record in indexed.query(r"^BRCA[0-9]+$", match="regex"):
     print(record.reference_sequence_name, record.start, record.attributes)
 print(indexed.metadata().term_count, stats.records_processed)
 ```

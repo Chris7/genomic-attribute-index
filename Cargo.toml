@@ -36,6 +36,7 @@ fst = "0.4"
 memmap2 = "0.9"
 noodles = { version = "0.101", features = ["bgzf", "core", "csi", "gff", "tabix"] }
 rayon = "1.11"
+regex = "1.12"
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 thiserror = "2.0"
