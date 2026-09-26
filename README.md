@@ -43,8 +43,8 @@ $ gai query-index annotations.gff3.gz BRCA --match prefix
 $ gai query-index annotations.gff3.gz RCA --match contains
 $ gai query-index annotations.gff3.gz '^BRCA[0-9]+$' --match regex
 $ gai inspect-index annotations.gff3.gz.gai
-$ gai profile query-index annotations.gff3.gz BRCA1
-$ gai profile --sample query-index annotations.gff3.gz BRCA1
+$ cargo run --features profiling -- profile query-index annotations.gff3.gz BRCA1
+$ cargo run --features profiling -- profile --sample query-index annotations.gff3.gz BRCA1
 $ gai sort annotations.gff3 > annotations.sorted.gff3
 $ gai sort annotations.bed > annotations.sorted.bed
 ```
@@ -54,11 +54,13 @@ $ gai sort annotations.bed > annotations.sorted.bed
 A coordinate index is discovered from an unambiguous sibling `.tbi` or `.csi`, but
 can be explicitly referenced by the `--coordinate-index` flag. Query output is lossless source
 record text on stdout, while build progress and phase timings go to stderr.
-Use `gai profile <command> ...` to emit tracing span entry, exit, and elapsed-time
-events for GAI's instrumented Rust functions to stderr. Profiling output can be
-verbose for large inputs; command results remain on stdout. Add `--sample` after
-`profile` to use a 100 Hz CPU sampler instead; it prints a sampled stack report
-to stderr without enabling per-function tracing events.
+Profiling support is opt-in and is not included in default builds. Build with
+the Cargo `profiling` feature and use `gai profile <command> ...` to print an
+aggregated tracing summary to stderr, grouped by call stack and sorted by total
+time. Each row reports call count, inclusive total duration, and average duration.
+Command results remain on stdout. Add `--sample` after `profile` to use a 100 Hz
+CPU sampler instead; it groups sampled application call stacks and reports sample
+counts, estimated time, and percentage to stderr without tracing.
 Sampling is currently supported on Unix platforms; function tracing is available
 on all supported platforms.
 

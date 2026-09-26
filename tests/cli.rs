@@ -229,17 +229,25 @@ fn cli_index_query_and_inspect() {
     assert!(inspection.contains("lengths compression"));
     assert!(!String::from_utf8_lossy(&inspected.stderr).contains("time.busy"));
 
-    let profiled = Command::new(binary)
-        .args(["profile", "inspect-index", &destination_string])
-        .output()
-        .expect("should run profiled inspect-index");
-    assert!(profiled.status.success(), "stderr: {:?}", profiled.stderr);
-    assert_eq!(profiled.stdout, inspected.stdout);
-    let profiling_stderr = String::from_utf8_lossy(&profiled.stderr);
-    assert!(profiling_stderr.contains("run"));
-    assert!(profiling_stderr.contains("time.busy"));
+    if cfg!(feature = "profiling") {
+        let profiled = Command::new(binary)
+            .args(["profile", "inspect-index", &destination_string])
+            .output()
+            .expect("should run profiled inspect-index");
+        assert!(profiled.status.success(), "stderr: {:?}", profiled.stderr);
+        assert_eq!(profiled.stdout, inspected.stdout);
+        let profiling_stderr = String::from_utf8_lossy(&profiled.stderr);
+        assert!(profiling_stderr.contains("Profile results"));
+        assert!(profiling_stderr.contains("Total (ms)"));
+        assert!(profiling_stderr.contains("Calls"));
+        assert!(!profiling_stderr.contains("time.busy"));
+        assert!(profiling_stderr.lines().any(|line| {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            fields.first() == Some(&"gai::compression_ratio") && fields.get(1) == Some(&"3")
+        }));
+    }
 
-    if cfg!(unix) {
+    if cfg!(all(unix, feature = "profiling")) {
         let sampled = Command::new(binary)
             .args(["profile", "--sample", "inspect-index", &destination_string])
             .output()
@@ -247,7 +255,11 @@ fn cli_index_query_and_inspect() {
         assert!(sampled.status.success(), "stderr: {:?}", sampled.stderr);
         assert_eq!(sampled.stdout, inspected.stdout);
         let sample_stderr = String::from_utf8_lossy(&sampled.stderr);
-        assert!(sample_stderr.contains("sampled CPU profile (100 Hz)"));
+        assert!(sample_stderr.contains("Sampling profile results"));
+        assert!(sample_stderr.contains("Samples"));
+        assert!(sample_stderr.contains("Time (ms)"));
+        assert!(sample_stderr.contains("Pct"));
+        assert!(!sample_stderr.contains("Report {"));
         assert!(!sample_stderr.contains("time.busy"));
     }
 
@@ -273,7 +285,11 @@ fn cli_index_query_and_inspect() {
     assert!(help.contains("build-index"));
     assert!(help.contains("query-index"));
     assert!(help.contains("inspect-index"));
-    assert!(help.contains("profile"));
+    assert_eq!(
+        help.contains("profile"),
+        cfg!(feature = "profiling"),
+        "profile command should only be included with the profiling feature"
+    );
     assert!(!help.contains("gff"));
 
     let old_surface = Command::new(binary)

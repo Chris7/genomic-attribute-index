@@ -40,14 +40,18 @@ regex = "1.12"
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 thiserror = "2.0"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"], optional = true }
 zstd = "0.13"
 flate2 = { version = "1.1.10", default-features = false, features = ["zlib-rs"] }
 natord = "1.0.9"
 
+[features]
+default = []
+profiling = ["dep:pprof", "dep:tracing", "dep:tracing-subscriber"]
+
 [target.'cfg(unix)'.dependencies]
-pprof = { version = "0.15", default-features = false }
+pprof = { version = "0.15", default-features = false, optional = true }
 
 [dev-dependencies]
 tempfile = "3.20"
