@@ -10,7 +10,7 @@ pub(crate) struct ExtractedRecord {
     pub(crate) span: SpanKey,
     pub(crate) terms: Vec<String>,
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn read_index_records<'a, R>(
     reader: &'a mut R,
     format: SortFormat,
@@ -82,7 +82,7 @@ where
         }
     })
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn scan_index_reader<R, F>(
     mut reader: R,
     format: SortFormat,
@@ -118,7 +118,7 @@ struct ScanIndexContext<'a> {
     configured: &'a HashSet<String>,
     case_sensitive: bool,
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn scan_index_path<F>(
     path: &Path,
     context: ScanIndexContext<'_>,
@@ -167,6 +167,7 @@ where
 }
 
 /// Builds a deterministic GAI beside a BGZF or plain GFF3 source.
+#[tracing::instrument(level = "trace", skip_all)]
 pub fn build_name_index(
     gff_path: impl AsRef<Path>,
     coordinate_index_path: impl AsRef<Path>,
@@ -183,6 +184,7 @@ pub fn build_name_index(
 }
 
 /// Builds a deterministic GAI with explicit resource and progress controls.
+#[tracing::instrument(level = "trace", skip_all)]
 pub fn build_name_index_with_options(
     gff_path: impl AsRef<Path>,
     coordinate_index_path: impl AsRef<Path>,
@@ -203,6 +205,7 @@ pub fn build_name_index_with_options(
 /// Builds a GAI with an explicit reference-specific span-block row target.
 /// The default [`build_name_index`] value is 4,096; this variant is provided
 /// for reproducible compression experiments and deployment tuning.
+#[tracing::instrument(level = "trace", skip_all)]
 pub fn build_name_index_with_span_block_size(
     gff_path: impl AsRef<Path>,
     coordinate_index_path: impl AsRef<Path>,
@@ -221,6 +224,7 @@ pub fn build_name_index_with_span_block_size(
 }
 
 /// Builds a GAI with explicit span-block and resource controls.
+#[tracing::instrument(level = "trace", skip_all)]
 pub fn build_name_index_with_options_and_span_block_size(
     gff_path: impl AsRef<Path>,
     coordinate_index_path: impl AsRef<Path>,
@@ -520,7 +524,7 @@ pub(crate) mod tests {
     use tempfile::tempdir;
 
     use super::*;
-
+    #[tracing::instrument(level = "trace", skip_all)]
     pub(crate) fn fixture_records() -> [&'static str; 6] {
         [
             "##gff-version 3",
@@ -531,7 +535,7 @@ pub(crate) mod tests {
             "chr2\tsrc\tgene\t10\t20\t.\t+\t.\tName=BRCA1",
         ]
     }
-
+    #[tracing::instrument(level = "trace", skip_all)]
     pub(crate) fn write_fixture(directory: &Path) -> (PathBuf, PathBuf) {
         let source_path = directory.join("fixture.gff3.gz");
         let index_path = directory.join("fixture.gff3.gz.tbi");
@@ -570,7 +574,7 @@ pub(crate) mod tests {
         index_writer.write_index(&index).expect("should write TBI");
         (source_path, index_path)
     }
-
+    #[tracing::instrument(level = "trace", skip_all)]
     pub(crate) fn write_tbi_lines(
         directory: &Path,
         stem: &str,
@@ -612,7 +616,7 @@ pub(crate) mod tests {
         drop(index_writer);
         (source_path, index_path)
     }
-
+    #[tracing::instrument(level = "trace", skip_all)]
     pub(crate) fn write_csi_fixture(directory: &Path) -> (PathBuf, PathBuf) {
         let source_path = directory.join("fixture-csi.gff3.gz");
         let index_path = directory.join("fixture-csi.gff3.gz.csi");
@@ -654,7 +658,7 @@ pub(crate) mod tests {
         index_writer.write_index(&index).expect("should write CSI");
         (source_path, index_path)
     }
-
+    #[tracing::instrument(level = "trace", skip_all)]
     pub(crate) fn write_bed_fixture(directory: &Path) -> (PathBuf, PathBuf) {
         let source_path = directory.join("fixture.bed.gz");
         let index_path = directory.join("fixture.bed.gz.tbi");
@@ -697,7 +701,7 @@ pub(crate) mod tests {
             .expect("should write BED TBI");
         (source_path, index_path)
     }
-
+    #[tracing::instrument(level = "trace", skip_all)]
     pub(crate) fn mutate_section(
         bytes: &mut [u8],
         kind: SectionKind,
@@ -728,7 +732,7 @@ pub(crate) mod tests {
         }
         panic!("missing section {kind:?}");
     }
-
+    #[tracing::instrument(level = "trace", skip_all)]
     pub(crate) fn mutate_section_directory_item_count(
         bytes: &mut [u8],
         kind: SectionKind,
@@ -747,7 +751,7 @@ pub(crate) mod tests {
         }
         panic!("missing section {kind:?}");
     }
-
+    #[tracing::instrument(level = "trace", skip_all)]
     pub(crate) fn mutate_section_directory_offset(
         bytes: &mut [u8],
         kind: SectionKind,
@@ -768,6 +772,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[tracing::instrument(level = "trace", skip_all)]
     fn test_span_blocks_are_reference_local_and_deterministic() {
         let mut spans = Vec::new();
         for index in 0..5_000_u64 {
@@ -809,6 +814,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[tracing::instrument(level = "trace", skip_all)]
     fn test_spill_budgets_and_compression_threads_are_byte_deterministic() {
         let directory = tempdir().expect("should create temp directory");
         let (source, coordinate_index) = write_fixture(directory.path());
@@ -869,6 +875,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[tracing::instrument(level = "trace", skip_all)]
     fn test_streaming_progress_and_fasta_fingerprint() {
         let directory = tempdir().expect("should create temp directory");
         let source = directory.path().join("fasta.gff3.gz");
@@ -954,6 +961,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[tracing::instrument(level = "trace", skip_all)]
     fn test_scan_progress_is_rate_limited() {
         let directory = tempdir().expect("should create temp directory");
         let mut storage = Vec::with_capacity(20_001);
@@ -1008,6 +1016,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[tracing::instrument(level = "trace", skip_all)]
     fn test_spill_run_fan_in_compaction_is_equivalent() {
         let directory = tempdir().expect("should create temp directory");
         let mut storage = Vec::new();
@@ -1046,6 +1055,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[tracing::instrument(level = "trace", skip_all)]
     fn test_valid_empty_index_has_no_terms_or_spans() {
         let directory = tempdir().unwrap();
         let (source, coordinate_index) = write_fixture(directory.path());

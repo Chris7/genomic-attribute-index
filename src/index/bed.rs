@@ -1,6 +1,6 @@
 use super::ExtractedRecord;
 use crate::*;
-
+#[tracing::instrument(level = "trace", skip_all)]
 pub(crate) fn extract_bed_record(
     raw: &[u8],
     line_number: usize,
@@ -95,6 +95,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[tracing::instrument(level = "trace", skip_all)]
     fn extracts_bed_name_and_zero_based_span() {
         let reference_ids = HashMap::from([(String::from("chr1"), 7)]);
         let extracted = extract_bed_record(b"chr1\t10\t25\t Alpha ", 1, &reference_ids, false)

@@ -112,6 +112,7 @@ pub enum MatchMode {
 
 impl MatchMode {
     /// Parses the explicit mode names used by the CLI and Python bindings.
+    #[tracing::instrument(level = "trace", skip_all)]
     pub fn parse(value: &str) -> Result<Self> {
         match value {
             "exact" => Ok(Self::Exact),
@@ -133,6 +134,7 @@ enum CompiledMatch {
 }
 
 impl CompiledMatch {
+    #[tracing::instrument(level = "trace", skip_all)]
     fn new(term: &str, mode: MatchMode, case_sensitive: bool) -> Result<Self> {
         match mode {
             MatchMode::Exact => Ok(Self::Exact(normalize_value(term, case_sensitive))),
@@ -151,6 +153,7 @@ impl CompiledMatch {
         }
     }
 
+    #[tracing::instrument(level = "trace", skip_all)]
     fn is_empty(&self) -> bool {
         match self {
             Self::Exact(query) | Self::Prefix(query) | Self::Contains(query) => query.is_empty(),
@@ -158,6 +161,7 @@ impl CompiledMatch {
         }
     }
 
+    #[tracing::instrument(level = "trace", skip_all)]
     fn matches_normalized(&self, value: &str) -> bool {
         match self {
             Self::Exact(query) => value == query,
@@ -180,6 +184,7 @@ pub struct NameIndexOptions {
 
 impl NameIndexOptions {
     /// Creates options and validates the explicit attribute list.
+    #[tracing::instrument(level = "trace", skip_all)]
     pub fn new<I, S>(attributes: I, case_sensitive: bool) -> Result<Self>
     where
         I: IntoIterator<Item = S>,
@@ -211,6 +216,7 @@ impl NameIndexOptions {
 
     /// Creates options for BED input, whose searchable value is always the
     /// `name` field in column 4.
+    #[tracing::instrument(level = "trace", skip_all)]
     pub fn bed(case_sensitive: bool) -> Self {
         Self {
             attributes: vec!["name".to_string()],
@@ -342,6 +348,7 @@ pub struct BuildOptions {
 }
 
 impl Default for BuildOptions {
+    #[tracing::instrument(level = "trace", skip_all)]
     fn default() -> Self {
         let workers = std::thread::available_parallelism()
             .map(NonZeroUsize::get)
@@ -358,24 +365,28 @@ impl Default for BuildOptions {
 
 impl BuildOptions {
     /// Sets the approximate bounded scan memory budget.
+    #[tracing::instrument(level = "trace", skip_all)]
     pub fn with_memory_budget(mut self, bytes: usize) -> Self {
         self.memory_budget_bytes = bytes;
         self
     }
 
     /// Sets the number of deterministic block-compression workers.
+    #[tracing::instrument(level = "trace", skip_all)]
     pub fn with_compression_threads(mut self, threads: usize) -> Self {
         self.compression_threads = threads;
         self
     }
 
     /// Sets the BGZF decompression worker count.
+    #[tracing::instrument(level = "trace", skip_all)]
     pub fn with_bgzf_threads(mut self, threads: usize) -> Self {
         self.bgzf_threads = threads;
         self
     }
 
     /// Sets a progress callback shared by the build operation.
+    #[tracing::instrument(level = "trace", skip_all)]
     pub fn with_progress<F>(mut self, callback: F) -> Self
     where
         F: Fn(BuildProgress) + Send + Sync + 'static,
@@ -412,6 +423,7 @@ pub struct GffRecord {
 
 impl GffRecord {
     /// Returns all decoded values for an attribute tag.
+    #[tracing::instrument(level = "trace", skip_all)]
     pub fn attribute_values(&self, tag: &str) -> impl Iterator<Item = &str> {
         self.attributes
             .iter()
@@ -433,6 +445,7 @@ pub struct Span {
 
 impl Span {
     /// Returns the checked zero-based half-open end.
+    #[tracing::instrument(level = "trace", skip_all)]
     pub fn end(self) -> Result<u64> {
         self.start
             .checked_add(self.length)
@@ -440,6 +453,7 @@ impl Span {
     }
 
     /// Converts one-based inclusive GFF coordinates at the parser boundary.
+    #[tracing::instrument(level = "trace", skip_all)]
     pub fn from_gff(reference_id: u32, gff_start: u64, gff_end: u64) -> Result<Self> {
         let (start, length) = gff_to_span(gff_start, gff_end)?;
         Ok(Self {
@@ -452,6 +466,7 @@ impl Span {
 
 /// Converts GFF3's one-based inclusive interval to a zero-based half-open
 /// `start + length` pair.
+#[tracing::instrument(level = "trace", skip_all)]
 pub fn gff_to_span(gff_start: u64, gff_end: u64) -> Result<(u64, u64)> {
     if gff_start == 0 || gff_end < gff_start {
         return Err(Error::InvalidCoordinate);
@@ -577,6 +592,7 @@ struct SpanKey {
 }
 
 impl From<SpanKey> for Span {
+    #[tracing::instrument(level = "trace", skip_all)]
     fn from(value: SpanKey) -> Self {
         Self {
             reference_id: value.reference_id,
@@ -603,6 +619,7 @@ enum CoordinateIndex {
 }
 
 impl CoordinateIndex {
+    #[tracing::instrument(level = "trace", skip_all)]
     fn dictionary(&self, source_format: SortFormat) -> Result<CoordinateDictionary> {
         let format = match self {
             Self::Tabix(index) => index
@@ -650,7 +667,7 @@ impl CoordinateIndex {
         })
     }
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn fingerprint_reference_dictionary(names: &[String]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     for name in names {
@@ -659,7 +676,7 @@ fn fingerprint_reference_dictionary(names: &[String]) -> [u8; 32] {
     }
     hasher.finalize().into()
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn fingerprint_file(path: &Path) -> Result<[u8; 32]> {
     let mut reader = File::open(path)?;
     let mut hasher = Sha256::new();
@@ -685,6 +702,7 @@ struct HashingReader<R> {
 }
 
 impl<R> HashingReader<R> {
+    #[tracing::instrument(level = "trace", skip_all)]
     fn with_counter(inner: R, bytes_read: Arc<AtomicU64>) -> Self {
         Self {
             inner,
@@ -693,6 +711,7 @@ impl<R> HashingReader<R> {
         }
     }
 
+    #[tracing::instrument(level = "trace", skip_all)]
     fn finish(self) -> ([u8; 32], u64) {
         (
             self.hasher.finalize().into(),
@@ -705,6 +724,7 @@ impl<R> Read for HashingReader<R>
 where
     R: Read,
 {
+    #[tracing::instrument(level = "trace", skip_all)]
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         let length = self.inner.read(buffer)?;
         if length != 0 {
@@ -720,6 +740,7 @@ trait HashingInput: BufRead {
 }
 
 impl HashingInput for BufReader<HashingReader<File>> {
+    #[tracing::instrument(level = "trace", skip_all)]
     fn drain_and_finish(mut self) -> io::Result<([u8; 32], u64)> {
         io::copy(&mut self, &mut io::sink())?;
         Ok(self.into_inner().finish())
@@ -727,6 +748,7 @@ impl HashingInput for BufReader<HashingReader<File>> {
 }
 
 impl HashingInput for bgzf::io::Reader<HashingReader<File>> {
+    #[tracing::instrument(level = "trace", skip_all)]
     fn drain_and_finish(mut self) -> io::Result<([u8; 32], u64)> {
         io::copy(&mut self, &mut io::sink())?;
         Ok(self.into_inner().finish())
@@ -734,6 +756,7 @@ impl HashingInput for bgzf::io::Reader<HashingReader<File>> {
 }
 
 impl HashingInput for bgzf::io::MultithreadedReader<HashingReader<File>> {
+    #[tracing::instrument(level = "trace", skip_all)]
     fn drain_and_finish(mut self) -> io::Result<([u8; 32], u64)> {
         let drain_result = io::copy(&mut self, &mut io::sink());
         let inner = self.finish()?;
@@ -741,7 +764,7 @@ impl HashingInput for bgzf::io::MultithreadedReader<HashingReader<File>> {
         Ok(inner.finish())
     }
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn read_coordinate_index_with_fingerprint(path: &Path) -> Result<(CoordinateIndex, [u8; 32])> {
     // Parse from one in-memory byte copy so the exact coordinate-index
     // fingerprint and the noodles reader share a single file read. The index
@@ -765,7 +788,7 @@ fn read_coordinate_index_with_fingerprint(path: &Path) -> Result<(CoordinateInde
         path.display()
     )))
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn validate_coordinate_index_format(format: Format, source_format: SortFormat) -> Result<()> {
     let expected = match source_format {
         SortFormat::Gff => CoordinateSystem::Gff,
@@ -785,6 +808,7 @@ fn validate_coordinate_index_format(format: Format, source_format: SortFormat) -
 
 /// Applies the GAI normalization policy: trim Unicode whitespace, then
 /// lowercase ASCII letters unless `case_sensitive` is true.
+#[tracing::instrument(level = "trace", skip_all)]
 pub fn normalize_value(value: &str, case_sensitive: bool) -> String {
     let trimmed = value.trim_matches(char::is_whitespace);
     if case_sensitive {
@@ -811,6 +835,7 @@ enum SectionKind {
 impl TryFrom<u32> for SectionKind {
     type Error = Error;
 
+    #[tracing::instrument(level = "trace", skip_all)]
     fn try_from(value: u32) -> Result<Self> {
         match value {
             1 => Ok(Self::Attributes),
@@ -871,15 +896,15 @@ struct SpanDirectoryEntry {
     starts_compression: u8,
     lengths_compression: u8,
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn put_u32(buffer: &mut Vec<u8>, value: u32) {
     buffer.extend_from_slice(&value.to_le_bytes());
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn put_u64(buffer: &mut Vec<u8>, value: u64) {
     buffer.extend_from_slice(&value.to_le_bytes());
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn read_u8(bytes: &[u8], offset: &mut usize, context: &str) -> Result<u8> {
     let value = *bytes
         .get(*offset)
@@ -887,7 +912,7 @@ fn read_u8(bytes: &[u8], offset: &mut usize, context: &str) -> Result<u8> {
     *offset += 1;
     Ok(value)
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn read_u16(bytes: &[u8], offset: &mut usize, context: &str) -> Result<u16> {
     let end = offset
         .checked_add(2)
@@ -902,7 +927,7 @@ fn read_u16(bytes: &[u8], offset: &mut usize, context: &str) -> Result<u16> {
     *offset = end;
     Ok(value)
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn read_u32(bytes: &[u8], offset: &mut usize, context: &str) -> Result<u32> {
     let end = offset
         .checked_add(4)
@@ -917,7 +942,7 @@ fn read_u32(bytes: &[u8], offset: &mut usize, context: &str) -> Result<u32> {
     *offset = end;
     Ok(value)
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn read_u64(bytes: &[u8], offset: &mut usize, context: &str) -> Result<u64> {
     let end = offset
         .checked_add(8)
@@ -932,7 +957,7 @@ fn read_u64(bytes: &[u8], offset: &mut usize, context: &str) -> Result<u64> {
     *offset = end;
     Ok(value)
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn read_array<const N: usize>(bytes: &[u8], offset: &mut usize, context: &str) -> Result<[u8; N]> {
     let end = offset
         .checked_add(N)
@@ -945,7 +970,7 @@ fn read_array<const N: usize>(bytes: &[u8], offset: &mut usize, context: &str) -
     *offset = end;
     Ok(value)
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn write_varint(buffer: &mut Vec<u8>, mut value: u64) {
     while value >= 0x80 {
         buffer.push((value as u8) | 0x80);
@@ -953,7 +978,7 @@ fn write_varint(buffer: &mut Vec<u8>, mut value: u64) {
     }
     buffer.push(value as u8);
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn read_varint(bytes: &[u8], offset: &mut usize, context: &str) -> Result<u64> {
     let mut value = 0_u64;
     for shift in (0..64).step_by(7) {
@@ -971,11 +996,11 @@ fn read_varint(bytes: &[u8], offset: &mut usize, context: &str) -> Result<u64> {
     }
     Err(Error::Corrupt(format!("unterminated varint in {context}")))
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn checksum(bytes: &[u8]) -> u32 {
     crc32fast::hash(bytes)
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn compress_block(bytes: &[u8]) -> Result<EncodedBlock> {
     let checksum = checksum(bytes);
     let compressed =
@@ -998,7 +1023,7 @@ fn compress_block(bytes: &[u8]) -> Result<EncodedBlock> {
         })
     }
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn decompress_block(
     compressed: &[u8],
     compression: u8,
@@ -1038,7 +1063,7 @@ fn decompress_block(
     }
     Ok(bytes)
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn encode_attributes(attributes: &[String]) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     put_u32(
@@ -1057,7 +1082,7 @@ fn encode_attributes(attributes: &[String]) -> Result<Vec<u8>> {
     }
     Ok(bytes)
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn decode_attributes(bytes: &[u8]) -> Result<Vec<String>> {
     let mut offset = 0;
     let count = read_u32(bytes, &mut offset, "attribute count")? as usize;
@@ -1102,6 +1127,7 @@ struct PostingEncoder {
 }
 
 impl PostingEncoder {
+    #[tracing::instrument(level = "trace", skip_all)]
     fn new() -> Self {
         Self {
             raw_blocks: Vec::new(),
@@ -1113,6 +1139,7 @@ impl PostingEncoder {
         }
     }
 
+    #[tracing::instrument(level = "trace", skip_all)]
     fn add(&mut self, term: String, spans: &[u64]) -> Result<()> {
         if spans.is_empty() {
             return Ok(());
@@ -1153,6 +1180,7 @@ impl PostingEncoder {
         Ok(())
     }
 
+    #[tracing::instrument(level = "trace", skip_all)]
     fn finish(mut self, compression_threads: usize) -> Result<PostingEncoding> {
         if !self.current.is_empty() || self.locators.is_empty() {
             self.raw_blocks.push(self.current);
@@ -1199,7 +1227,7 @@ impl PostingEncoder {
         ))
     }
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn encode_delta_posting_record(spans: &[u64]) -> Result<Vec<u8>> {
     let count = u64::try_from(spans.len())
         .map_err(|_| Error::InvalidInput("too many spans for a term".into()))?;
@@ -1229,7 +1257,7 @@ fn encode_delta_posting_record(spans: &[u64]) -> Result<Vec<u8>> {
     }
     Ok(record)
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn compress_blocks_parallel(blocks: &[Vec<u8>], thread_count: usize) -> Result<Vec<EncodedBlock>> {
     use rayon::prelude::*;
 
@@ -1249,6 +1277,7 @@ fn compress_blocks_parallel(blocks: &[Vec<u8>], thread_count: usize) -> Result<V
 }
 
 #[cfg(test)]
+#[tracing::instrument(level = "trace", skip_all)]
 fn encode_postings_groups<I>(groups: I, compression_threads: usize) -> Result<PostingEncoding>
 where
     I: IntoIterator<Item = (String, Vec<u64>)>,
@@ -1262,6 +1291,7 @@ where
 
 #[allow(clippy::type_complexity)]
 #[cfg(test)]
+#[tracing::instrument(level = "trace", skip_all)]
 fn encode_postings(
     term_spans: &BTreeMap<String, BTreeSet<u64>>,
 ) -> Result<(Vec<u8>, Vec<PostingDirectoryEntry>, Vec<u8>, u64)> {
@@ -1271,7 +1301,7 @@ fn encode_postings(
     let (terms, directory, data, before, _, _) = encode_postings_groups(groups, 1)?;
     Ok((terms, directory, data, before))
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn encode_for_values(values: &[u64]) -> Result<(Vec<u8>, u64, u8)> {
     if values.is_empty() {
         return Ok((Vec::new(), 0, 0));
@@ -1282,7 +1312,7 @@ fn encode_for_values(values: &[u64]) -> Result<(Vec<u8>, u64, u8)> {
         .ok_or_else(|| Error::InvalidInput("empty integer stream".into()))?;
     encode_for_values_with_base(values, base)
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn encode_for_values_with_base(values: &[u64], base: u64) -> Result<(Vec<u8>, u64, u8)> {
     if values.is_empty() {
         return Ok((Vec::new(), base, 0));
@@ -1333,6 +1363,7 @@ fn encode_for_values_with_base(values: &[u64], base: u64) -> Result<(Vec<u8>, u6
 /// so this payload contains exactly one delta for every row after the first.
 /// Equal starts therefore encode as a zero delta, and a single-row block has
 /// an empty payload.
+#[tracing::instrument(level = "trace", skip_all)]
 fn encode_delta_start_payload(spans: &[SpanKey]) -> Result<Vec<u8>> {
     if spans.is_empty() {
         return Err(Error::InvalidInput(
@@ -1356,7 +1387,7 @@ fn encode_delta_start_payload(spans: &[SpanKey]) -> Result<Vec<u8>> {
     }
     Ok(payload)
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn canonical_varint_length(value: u64) -> usize {
     if value == 0 {
         1
@@ -1364,7 +1395,7 @@ fn canonical_varint_length(value: u64) -> usize {
         (64 - value.leading_zeros()).div_ceil(7) as usize
     }
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn read_canonical_varint(bytes: &[u8], offset: &mut usize, context: &str) -> Result<u64> {
     let start = *offset;
     let value = read_varint(bytes, offset, context)?;
@@ -1373,7 +1404,7 @@ fn read_canonical_varint(bytes: &[u8], offset: &mut usize, context: &str) -> Res
     }
     Ok(value)
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn encode_length_payload(spans: &[SpanKey]) -> Result<(Vec<u8>, u8)> {
     let lengths = spans.iter().map(|span| span.length).collect::<Vec<_>>();
     let mut varints = Vec::new();
@@ -1425,6 +1456,7 @@ struct SpanEncodingStats {
 }
 
 #[allow(clippy::type_complexity)]
+#[tracing::instrument(level = "trace", skip_all)]
 fn encode_span_blocks_with_threads(
     spans: &[SpanKey],
     spans_per_block: usize,
@@ -1559,7 +1591,7 @@ fn encode_span_blocks_with_threads(
     }
     Ok((directory, starts_data, lengths_data, stats))
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn encode_span_directory(entries: &[SpanDirectoryEntry]) -> Result<Vec<u8>> {
     let mut bytes = Vec::with_capacity(
         entries
@@ -1588,7 +1620,7 @@ fn encode_span_directory(entries: &[SpanDirectoryEntry]) -> Result<Vec<u8>> {
     }
     Ok(bytes)
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn encode_posting_directory(entries: &[PostingDirectoryEntry]) -> Result<Vec<u8>> {
     let mut bytes = Vec::with_capacity(
         entries
@@ -1607,19 +1639,19 @@ fn encode_posting_directory(entries: &[PostingDirectoryEntry]) -> Result<Vec<u8>
     }
     Ok(bytes)
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn set_u16(bytes: &mut [u8], offset: usize, value: u16) {
     bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn set_u32(bytes: &mut [u8], offset: usize, value: u32) {
     bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn set_u64(bytes: &mut [u8], offset: usize, value: u64) {
     bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn encode_directory(entries: &[SectionDirectoryEntry]) -> Result<Vec<u8>> {
     let mut bytes = Vec::with_capacity(
         entries
@@ -1640,6 +1672,7 @@ fn encode_directory(entries: &[SectionDirectoryEntry]) -> Result<Vec<u8>> {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[tracing::instrument(level = "trace", skip_all)]
 fn serialize_index(
     attributes: &[String],
     case_sensitive: bool,
@@ -1780,7 +1813,7 @@ struct SpillCollector {
     peak_working_set_bytes: usize,
     run_paths: Vec<PathBuf>,
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn create_spill_file(parent: &Path, prefix: &str) -> Result<(File, PathBuf)> {
     let counter = RUN_COUNTER.fetch_add(1, Ordering::Relaxed);
     let path = parent.join(format!(
@@ -1801,6 +1834,7 @@ struct SpillRunGuard {
 }
 
 impl Drop for SpillRunGuard {
+    #[tracing::instrument(level = "trace", skip_all)]
     fn drop(&mut self) {
         if let Some(path) = self.path.take() {
             let _ = fs::remove_file(path);
@@ -1809,6 +1843,7 @@ impl Drop for SpillRunGuard {
 }
 
 impl SpillCollector {
+    #[tracing::instrument(level = "trace", skip_all)]
     fn new(memory_budget_bytes: usize, parent: &Path, prefix: &str) -> Self {
         Self {
             memory_budget_bytes,
@@ -1822,6 +1857,7 @@ impl SpillCollector {
         }
     }
 
+    #[tracing::instrument(level = "trace", skip_all)]
     fn add(&mut self, span: SpanKey, terms: &[String]) -> Result<bool> {
         self.spans.push(span);
         self.estimated_bytes = self
@@ -1840,6 +1876,7 @@ impl SpillCollector {
         Ok(self.estimated_bytes >= self.memory_budget_bytes)
     }
 
+    #[tracing::instrument(level = "trace", skip_all)]
     fn spill(&mut self) -> Result<Option<PathBuf>> {
         if self.spans.is_empty() && self.pairs.is_empty() {
             return Ok(None);
@@ -1888,14 +1925,17 @@ impl SpillCollector {
         Ok(Some(path))
     }
 
+    #[tracing::instrument(level = "trace", skip_all)]
     fn finish(&mut self) -> Result<()> {
         self.spill().map(|_| ())
     }
 
+    #[tracing::instrument(level = "trace", skip_all)]
     fn run_paths(&self) -> &[PathBuf] {
         &self.run_paths
     }
 
+    #[tracing::instrument(level = "trace", skip_all)]
     fn compact_runs_if_needed(&mut self) -> Result<()> {
         while self.run_paths.len() > MAX_RUN_FANIN {
             let group = self.run_paths.drain(..MAX_RUN_FANIN).collect::<Vec<_>>();
@@ -1914,19 +1954,21 @@ impl SpillCollector {
         Ok(())
     }
 
+    #[tracing::instrument(level = "trace", skip_all)]
     fn peak_working_set_bytes(&self) -> u64 {
         self.peak_working_set_bytes as u64
     }
 }
 
 impl Drop for SpillCollector {
+    #[tracing::instrument(level = "trace", skip_all)]
     fn drop(&mut self) {
         for path in &self.run_paths {
             let _ = fs::remove_file(path);
         }
     }
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn read_run_u32(reader: &mut impl Read, context: &str) -> Result<u32> {
     let mut bytes = [0_u8; 4];
     reader
@@ -1934,7 +1976,7 @@ fn read_run_u32(reader: &mut impl Read, context: &str) -> Result<u32> {
         .map_err(|error| Error::InvalidInput(format!("truncated {context}: {error}")))?;
     Ok(u32::from_le_bytes(bytes))
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn read_run_u64(reader: &mut impl Read, context: &str) -> Result<u64> {
     let mut bytes = [0_u8; 8];
     reader
@@ -1949,6 +1991,7 @@ struct SpanRunReader {
 }
 
 impl SpanRunReader {
+    #[tracing::instrument(level = "trace", skip_all)]
     fn open(path: &Path) -> Result<Self> {
         let mut reader = io::BufReader::new(File::open(path)?);
         let mut magic = [0_u8; 8];
@@ -1960,6 +2003,7 @@ impl SpanRunReader {
         Ok(Self { reader, remaining })
     }
 
+    #[tracing::instrument(level = "trace", skip_all)]
     fn next(&mut self) -> Result<Option<SpanKey>> {
         if self.remaining == 0 {
             return Ok(None);
@@ -1980,6 +2024,7 @@ struct TermRunReader {
 }
 
 impl TermRunReader {
+    #[tracing::instrument(level = "trace", skip_all)]
     fn open(path: &Path) -> Result<Self> {
         let mut reader = io::BufReader::new(File::open(path)?);
         let mut magic = [0_u8; 8];
@@ -1998,6 +2043,7 @@ impl TermRunReader {
         Ok(Self { reader, remaining })
     }
 
+    #[tracing::instrument(level = "trace", skip_all)]
     fn next(&mut self) -> Result<Option<TermSpanObservation>> {
         if self.remaining == 0 {
             return Ok(None);
@@ -2019,7 +2065,7 @@ impl TermRunReader {
         Ok(Some(TermSpanObservation { term, span }))
     }
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn merge_run_group(group: &[PathBuf], parent: &Path, prefix: &str) -> Result<PathBuf> {
     let (file, path) = create_spill_file(parent, prefix)?;
     let mut guard = SpillRunGuard {
@@ -2107,7 +2153,7 @@ fn merge_run_group(group: &[PathBuf], parent: &Path, prefix: &str) -> Result<Pat
     guard.path = None;
     Ok(path)
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn merge_unique_spans(run_paths: &[PathBuf]) -> Result<Vec<SpanKey>> {
     let mut readers = run_paths
         .iter()
@@ -2132,7 +2178,7 @@ fn merge_unique_spans(run_paths: &[PathBuf]) -> Result<Vec<SpanKey>> {
     }
     Ok(spans)
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn encode_postings_from_runs(
     run_paths: &[PathBuf],
     coordinate_spans: &[SpanKey],
@@ -2179,7 +2225,7 @@ fn encode_postings_from_runs(
     }
     encoder.finish(compression_threads)
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn report_progress(
     options: &BuildOptions,
     phase: BuildPhase,
@@ -2196,7 +2242,7 @@ fn report_progress(
         });
     }
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn atomic_write(destination: &Path, bytes: &[u8]) -> Result<()> {
     let parent = destination.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
@@ -2218,7 +2264,7 @@ fn atomic_write(destination: &Path, bytes: &[u8]) -> Result<()> {
         Error::Io(error)
     })
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn tempfile_path(parent: &Path, destination_name: &std::ffi::OsStr) -> Result<TempFile> {
     let mut path = parent.to_path_buf();
     let mut name = destination_name.to_os_string();

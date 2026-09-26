@@ -11,6 +11,7 @@ enum IndexStorage {
 }
 
 impl AsRef<[u8]> for IndexStorage {
+    #[tracing::instrument(level = "trace", skip_all)]
     fn as_ref(&self) -> &[u8] {
         match self {
             Self::Owned(bytes) => bytes,
@@ -32,12 +33,14 @@ pub struct NameIndexReader {
 
 impl NameIndexReader {
     /// Opens and validates a GAI file without opening its source files.
+    #[tracing::instrument(level = "trace", skip_all)]
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let bytes = fs::read(path)?;
         Self::from_bytes(bytes)
     }
 
     /// Opens and validates a GAI using a read-only memory map.
+    #[tracing::instrument(level = "trace", skip_all)]
     pub fn open_mmap(path: impl AsRef<Path>) -> Result<Self> {
         let file = File::open(path)?;
         // SAFETY: the file descriptor remains valid while the map is created;
@@ -48,10 +51,12 @@ impl NameIndexReader {
 
     /// Parses a GAI byte stream.  This is useful for corruption tests and for
     /// callers that memory-map the file themselves before handing it to GAI.
+    #[tracing::instrument(level = "trace", skip_all)]
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
         Self::from_storage(IndexStorage::Owned(bytes))
     }
 
+    #[tracing::instrument(level = "trace", skip_all)]
     fn from_storage(storage: IndexStorage) -> Result<Self> {
         let bytes = storage.as_ref();
         if bytes.len() < HEADER_SIZE {
@@ -372,16 +377,19 @@ impl NameIndexReader {
     }
 
     /// Returns format metadata and configured attributes.
+    #[tracing::instrument(level = "trace", skip_all)]
     pub fn metadata(&self) -> &IndexMetadata {
         &self.metadata
     }
 
     /// Returns a copy of metadata for inspection interfaces.
+    #[tracing::instrument(level = "trace", skip_all)]
     pub fn inspect(&self) -> IndexMetadata {
         self.metadata.clone()
     }
 
     /// Looks up a normalized term and returns its exact spans.
+    #[tracing::instrument(level = "trace", skip_all)]
     pub fn lookup_spans(&self, term: &str) -> Result<Vec<Span>> {
         self.lookup_spans_with_mode(term, MatchMode::Exact)
     }
@@ -390,6 +398,7 @@ impl NameIndexReader {
     /// its coordinate-ordered spans. Prefix matching uses the FST automaton;
     /// contains and regex matching scan keys incrementally. Each referenced
     /// postings block is decoded at most once.
+    #[tracing::instrument(level = "trace", skip_all)]
     pub fn lookup_spans_with_mode(&self, term: &str, mode: MatchMode) -> Result<Vec<Span>> {
         let (span_ids, _) = self.lookup_span_ids_with_mode_and_stats(term, mode)?;
         self.resolve_span_ids(&span_ids)
@@ -397,6 +406,7 @@ impl NameIndexReader {
 
     /// Looks up spans and reports the independently decoded bytes used by an
     /// exact query.
+    #[tracing::instrument(level = "trace", skip_all)]
     pub fn lookup_spans_with_stats(&self, term: &str) -> Result<(Vec<Span>, LookupStats)> {
         self.lookup_spans_with_mode_and_stats(term, MatchMode::Exact)
     }
@@ -404,6 +414,7 @@ impl NameIndexReader {
     /// Looks up spans with an explicit match mode and reports the independently
     /// decoded bytes used by the lookup. Each postings and span block is
     /// counted once even when several matching terms or span IDs share it.
+    #[tracing::instrument(level = "trace", skip_all)]
     pub fn lookup_spans_with_mode_and_stats(
         &self,
         term: &str,
@@ -422,17 +433,20 @@ impl NameIndexReader {
     }
 
     /// Returns the sorted span IDs for an exact normalized term.
+    #[tracing::instrument(level = "trace", skip_all)]
     pub fn lookup_span_ids(&self, term: &str) -> Result<Vec<u64>> {
         self.lookup_span_ids_with_mode(term, MatchMode::Exact)
     }
 
     /// Returns the sorted, deduplicated span IDs for a normalized term and
     /// explicit match mode.
+    #[tracing::instrument(level = "trace", skip_all)]
     pub fn lookup_span_ids_with_mode(&self, term: &str, mode: MatchMode) -> Result<Vec<u64>> {
         self.lookup_span_ids_with_mode_and_stats(term, mode)
             .map(|(span_ids, _)| span_ids)
     }
 
+    #[tracing::instrument(level = "trace", skip_all)]
     fn lookup_span_ids_with_mode_and_stats(
         &self,
         term: &str,
@@ -442,6 +456,7 @@ impl NameIndexReader {
         self.lookup_span_ids_with_matcher_and_stats(&matcher)
     }
 
+    #[tracing::instrument(level = "trace", skip_all)]
     fn lookup_span_ids_with_matcher_and_stats(
         &self,
         matcher: &CompiledMatch,
@@ -507,6 +522,7 @@ impl NameIndexReader {
     }
 
     /// Resolves one span ID using a binary search over fixed-width block entries.
+    #[tracing::instrument(level = "trace", skip_all)]
     pub fn resolve_span_id(&self, span_id: u64) -> Result<Span> {
         self.resolve_span_ids(&[span_id])?
             .into_iter()
@@ -516,11 +532,13 @@ impl NameIndexReader {
 
     /// Resolves a batch of span IDs while decoding each referenced span block
     /// at most once. The input and output retain the same order.
+    #[tracing::instrument(level = "trace", skip_all)]
     pub fn resolve_span_ids(&self, span_ids: &[u64]) -> Result<Vec<Span>> {
         self.resolve_span_ids_with_stats(span_ids)
             .map(|(spans, _, _)| spans)
     }
 
+    #[tracing::instrument(level = "trace", skip_all)]
     fn resolve_span_ids_with_stats(&self, span_ids: &[u64]) -> Result<(Vec<Span>, u64, u64)> {
         let mut requests = BTreeMap::<usize, Vec<(usize, usize)>>::new();
         for (output_index, &span_id) in span_ids.iter().enumerate() {
@@ -570,6 +588,7 @@ impl NameIndexReader {
         Ok((spans, requests.len() as u64, span_bytes_decompressed))
     }
 
+    #[tracing::instrument(level = "trace", skip_all)]
     fn section(&self, kind: SectionKind) -> Result<&[u8]> {
         let section = self
             .sections
@@ -585,6 +604,7 @@ impl NameIndexReader {
             .ok_or_else(|| Error::Corrupt("section range out of bounds".into()))
     }
 
+    #[tracing::instrument(level = "trace", skip_all)]
     fn decode_posting_block(&self, block_id: usize) -> Result<Vec<u8>> {
         let entry = self
             .posting_directory
@@ -607,6 +627,7 @@ impl NameIndexReader {
         )
     }
 
+    #[tracing::instrument(level = "trace", skip_all)]
     fn decode_starts_block(&self, block_id: usize) -> Result<Vec<u8>> {
         let entry = self
             .span_directory
@@ -629,6 +650,7 @@ impl NameIndexReader {
         )
     }
 
+    #[tracing::instrument(level = "trace", skip_all)]
     fn decode_lengths_block(&self, block_id: usize) -> Result<Vec<u8>> {
         let entry = self
             .span_directory
@@ -651,7 +673,7 @@ impl NameIndexReader {
         )
     }
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 pub(crate) fn decode_posting_record(
     bytes: &[u8],
     record_offset: usize,
@@ -664,7 +686,7 @@ pub(crate) fn decode_posting_record(
     }
     decode_delta_posting_record(bytes, &mut offset, count, span_count_limit)
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn decode_delta_posting_record(
     bytes: &[u8],
     offset: &mut usize,
@@ -695,7 +717,7 @@ fn decode_delta_posting_record(
     }
     Ok(ids)
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn decode_posting_directory(
     bytes: &[u8],
     data_length: u64,
@@ -745,7 +767,7 @@ fn decode_posting_directory(
     }
     Ok(entries)
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn decode_span_directory(
     bytes: &[u8],
     starts_data_length: u64,
@@ -881,7 +903,7 @@ fn decode_span_directory(
     }
     Ok(entries)
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 pub(crate) fn decode_for_stream(
     bytes: &[u8],
     offset: &mut usize,
@@ -937,7 +959,7 @@ pub(crate) fn decode_for_stream(
     }
     Ok(values)
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 pub(crate) fn decode_delta_start_payload(
     payload: &[u8],
     entry: &SpanDirectoryEntry,
@@ -966,7 +988,7 @@ pub(crate) fn decode_delta_start_payload(
     }
     Ok(starts)
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 pub(crate) fn decode_length_payload(
     payload: &[u8],
     entry: &SpanDirectoryEntry,
@@ -1040,7 +1062,7 @@ pub(crate) fn decode_length_payload(
     }
     Ok(lengths)
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 pub(crate) fn decode_span_rows(
     starts_payload: &[u8],
     lengths_payload: &[u8],
@@ -1068,6 +1090,7 @@ pub(crate) fn decode_span_rows(
 }
 
 #[cfg(test)]
+#[tracing::instrument(level = "trace", skip_all)]
 pub(crate) fn decode_span_row(
     starts_payload: &[u8],
     lengths_payload: &[u8],
@@ -1095,6 +1118,7 @@ pub struct IndexedSource {
 impl IndexedSource {
     /// Opens a source, coordinate index, and GAI and rejects stale pairs by
     /// checking all source, index, and reference-dictionary fingerprints.
+    #[tracing::instrument(level = "trace", skip_all)]
     pub fn open(
         source_path: impl AsRef<Path>,
         coordinate_index_path: impl AsRef<Path>,
@@ -1110,6 +1134,7 @@ impl IndexedSource {
 
     /// Opens an indexed source while additionally checking the caller's
     /// attribute and normalization configuration against the stored header.
+    #[tracing::instrument(level = "trace", skip_all)]
     pub fn open_with_options(
         source_path: impl AsRef<Path>,
         coordinate_index_path: impl AsRef<Path>,
@@ -1125,6 +1150,7 @@ impl IndexedSource {
         )
     }
 
+    #[tracing::instrument(level = "trace", skip_all)]
     fn open_inner(
         source_path: &Path,
         coordinate_index_path: &Path,
@@ -1195,6 +1221,7 @@ impl IndexedSource {
     }
 
     /// Returns GAI metadata.
+    #[tracing::instrument(level = "trace", skip_all)]
     pub fn metadata(&self) -> &IndexMetadata {
         self.name_index.metadata()
     }
@@ -1203,12 +1230,14 @@ impl IndexedSource {
     /// records in source coordinate order. Each posted span is queried as an
     /// exact coordinate interval; returned chunks are then merged and read
     /// once. Unknown terms are successful empty queries.
+    #[tracing::instrument(level = "trace", skip_all)]
     pub fn query_name(&mut self, term: &str) -> Result<Vec<GffRecord>> {
         self.query_name_with_mode(term, MatchMode::Exact)
     }
 
     /// Queries a configured attribute value exactly and returns records plus
     /// bounded query instrumentation.
+    #[tracing::instrument(level = "trace", skip_all)]
     pub fn query_name_with_stats(&mut self, term: &str) -> Result<(Vec<GffRecord>, QueryStats)> {
         self.query_name_with_mode_and_stats(term, MatchMode::Exact)
     }
@@ -1220,6 +1249,7 @@ impl IndexedSource {
     /// unioned and retrieved through the same batched TBI/CSI path. Regex
     /// patterns are unanchored searches by default, preserve regex syntax,
     /// and use Unicode-aware case folding for case-insensitive indexes.
+    #[tracing::instrument(level = "trace", skip_all)]
     pub fn query_name_with_mode(
         &mut self,
         term: &str,
@@ -1231,6 +1261,7 @@ impl IndexedSource {
 
     /// Queries a configured attribute value or BED name using an explicit match mode and
     /// returns bounded query instrumentation.
+    #[tracing::instrument(level = "trace", skip_all)]
     pub fn query_name_with_mode_and_stats(
         &mut self,
         term: &str,
@@ -1315,16 +1346,18 @@ impl IndexedSource {
     }
 
     /// Returns the path of the coordinate index used for this reader.
+    #[tracing::instrument(level = "trace", skip_all)]
     pub fn coordinate_index_path(&self) -> &Path {
         &self.coordinate_index_path
     }
 
     /// Returns the GAI reader for callers needing direct span lookup.
+    #[tracing::instrument(level = "trace", skip_all)]
     pub fn name_index(&self) -> &NameIndexReader {
         &self.name_index
     }
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 pub(crate) fn merge_query_chunks(mut chunks: Vec<Chunk>) -> Vec<Chunk> {
     chunks.sort_unstable_by_key(|chunk| (chunk.start(), chunk.end()));
     let mut merged: Vec<Chunk> = Vec::with_capacity(chunks.len());
@@ -1349,7 +1382,7 @@ pub(crate) struct QueryReadContext<'a> {
     pub(crate) case_sensitive: bool,
     pub(crate) matcher: &'a CompiledMatch,
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 pub(crate) fn read_query_chunks(
     source_path: &Path,
     source_format: SortFormat,
@@ -1375,6 +1408,7 @@ mod tests {
     };
 
     #[test]
+    #[tracing::instrument(level = "trace", skip_all)]
     fn test_corruption_is_an_error() {
         let directory = tempdir().expect("should create temp directory");
         let (source, coordinate_index) = write_fixture(directory.path());
@@ -1407,6 +1441,7 @@ mod tests {
     }
 
     #[test]
+    #[tracing::instrument(level = "trace", skip_all)]
     fn test_varint_boundaries_and_malformed_values() {
         for value in [0, 1, 127, 128, 255, 16_384, u32::MAX as u64, u64::MAX] {
             let mut bytes = Vec::new();
@@ -1438,6 +1473,7 @@ mod tests {
     }
 
     #[test]
+    #[tracing::instrument(level = "trace", skip_all)]
     fn test_adaptive_span_encodings_round_trip() {
         let example = [10_u64, 10, 15, 20]
             .into_iter()
@@ -1602,6 +1638,7 @@ mod tests {
     }
 
     #[test]
+    #[tracing::instrument(level = "trace", skip_all)]
     fn test_delta_start_payload_rejects_malformed_payloads_without_unbounded_work() {
         let values = [
             SpanKey {
@@ -1707,6 +1744,7 @@ mod tests {
     }
 
     #[test]
+    #[tracing::instrument(level = "trace", skip_all)]
     fn test_attribute_and_data_section_item_counts_are_validated() {
         let directory = tempdir().expect("should create temp directory");
         let (source, coordinate_index) = write_fixture(directory.path());
@@ -1784,6 +1822,7 @@ mod tests {
     }
 
     #[test]
+    #[tracing::instrument(level = "trace", skip_all)]
     fn test_corruption_classes_are_rejected_or_bounded() {
         let directory = tempdir().unwrap();
         let (source, coordinate_index) = write_fixture(directory.path());
