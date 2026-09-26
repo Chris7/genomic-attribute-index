@@ -104,7 +104,10 @@ jobs:
         with:
           toolchain: nightly-2026-06-26
       - name: Prepare Python package data directory
-        run: mkdir -p python/gai.data
+        shell: python
+        run: |
+          from pathlib import Path
+          Path("python/gai.data").mkdir(parents=True, exist_ok=True)
       - uses: PyO3/maturin-action@86b9d133d34bc1b40018696f782949dac11bd380
         with:
           command: sdist
@@ -133,7 +136,10 @@ jobs:
         with:
           toolchain: nightly-2026-06-26
       - name: Prepare Python package data directory
-        run: mkdir -p python/gai.data/scripts
+        shell: python
+        run: |
+          from pathlib import Path
+          Path("python/gai.data/scripts").mkdir(parents=True, exist_ok=True)
       - name: Build gai binary
         run: cargo build --release --locked --bin gai
       - name: Stage gai binary for Python wheel
