@@ -1,6 +1,6 @@
 use super::QueryReadContext;
 use crate::*;
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn parsed_record_from_record_buf(
     record: &gff::feature::RecordBuf,
     raw_line: String,
@@ -67,7 +67,7 @@ fn parsed_record_from_record_buf(
         },
     })
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn feature_record_span<R>(record: &R, reference_ids: &HashMap<String, u32>) -> Result<SpanKey>
 where
     R: gff::feature::Record + ?Sized,
@@ -94,7 +94,7 @@ where
         length,
     })
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn feature_record_matches_term<R>(
     record: &R,
     configured_attributes: &HashSet<String>,
@@ -126,7 +126,7 @@ where
     }
     Ok(false)
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn parsed_record_from_feature_record<R>(
     record: &R,
     raw_line: String,
@@ -139,7 +139,7 @@ where
         .map_err(|error| Error::InvalidInput(format!("invalid GFF record: {error}")))?;
     parsed_record_from_record_buf(&record, raw_line, reference_ids)
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 pub(super) fn read_gff_query_chunks(
     source: File,
     chunks: &[Chunk],
@@ -208,6 +208,7 @@ mod tests {
     };
 
     #[test]
+    #[tracing::instrument(level = "trace", skip_all)]
     fn test_name_index_round_trip_and_query() {
         let directory = tempdir().expect("should create temp directory");
         let (source, coordinate_index) = write_fixture(directory.path());
@@ -346,6 +347,7 @@ mod tests {
     }
 
     #[test]
+    #[tracing::instrument(level = "trace", skip_all)]
     fn test_configured_attributes_and_disjoint_query_spans() {
         let directory = tempdir().expect("should create temp directory");
         let (source, coordinate_index) = write_fixture(directory.path());
@@ -423,6 +425,7 @@ mod tests {
     }
 
     #[test]
+    #[tracing::instrument(level = "trace", skip_all)]
     fn test_query_exact_spans_preserves_identical_records_and_overlap_order() {
         let directory = tempdir().expect("should create temporary directory");
         let first = "chr1\tsrc\tgene\t10\t20\t.\t+\t.\tName=overlap";
@@ -461,6 +464,7 @@ mod tests {
     }
 
     #[test]
+    #[tracing::instrument(level = "trace", skip_all)]
     fn test_contains_filters_nonmatching_records_at_a_shared_span() {
         let directory = tempdir().expect("should create temporary directory");
         let matching = "chr1\tsrc\tgene\t10\t20\t.\t+\t.\tName=Alpha";
@@ -494,6 +498,7 @@ mod tests {
     }
 
     #[test]
+    #[tracing::instrument(level = "trace", skip_all)]
     fn test_query_chunk_union_and_virtual_position_deduplication() {
         let merged = merge_query_chunks(vec![
             Chunk::new(
@@ -576,6 +581,7 @@ mod tests {
     }
 
     #[test]
+    #[tracing::instrument(level = "trace", skip_all)]
     fn test_query_same_start_preserves_source_length_order() {
         let directory = tempdir().expect("should create temporary directory");
         let longer = "chr1\tsrc\tgene\t10\t30\t.\t+\t.\tName=same-start";
@@ -602,6 +608,7 @@ mod tests {
     }
 
     #[test]
+    #[tracing::instrument(level = "trace", skip_all)]
     fn test_feature_crossing_bgzf_block_boundary_is_queryable() {
         let directory = tempdir().expect("should create temporary directory");
         let source = directory.path().join("large.gff3.gz");
@@ -658,6 +665,7 @@ mod tests {
     }
 
     #[test]
+    #[tracing::instrument(level = "trace", skip_all)]
     fn test_csi_build_query_and_index_fingerprints() {
         let directory = tempdir().expect("should create temp directory");
         let (source, coordinate_index) = write_csi_fixture(directory.path());

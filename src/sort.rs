@@ -33,6 +33,7 @@ pub enum SortFormat {
 impl SortFormat {
     /// Infers a format from a path's extension, including compressed inputs
     /// such as .gff.gz, .gff3.bgz, and .bed.bgzf.
+    #[tracing::instrument(level = "trace", skip_all)]
     pub fn from_path(path: &Path) -> Result<Self> {
         let mut path = path;
 
@@ -77,7 +78,7 @@ impl SortFormat {
         }
     }
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 pub fn open_reader(path: &Path) -> io::Result<Box<dyn BufRead>> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
@@ -97,6 +98,7 @@ pub fn open_reader(path: &Path) -> io::Result<Box<dyn BufRead>> {
 
 /// Sorts an annotation file inferred from its extension and writes records to
 /// `writer` in lossless text order.
+#[tracing::instrument(level = "trace", skip_all)]
 pub fn sort_file(input: impl AsRef<Path>, disk_sort: bool, writer: impl Write) -> Result<()> {
     let input = input.as_ref();
     let format = SortFormat::from_path(input)?;
@@ -111,6 +113,7 @@ pub fn sort_file(input: impl AsRef<Path>, disk_sort: bool, writer: impl Write) -
 ///
 /// Returning Ok(None) from `parse` skips a line, which is useful for
 /// comments/header lines.
+#[tracing::instrument(level = "trace", skip_all)]
 fn read_records<R, T, F>(mut reader: R, mut parse: F) -> impl Iterator<Item = io::Result<T>>
 where
     R: BufRead,
@@ -145,6 +148,7 @@ where
 ///
 /// The input is consumed completely before this function returns, so callers
 /// can safely use state borrowed by the input parser afterward.
+#[tracing::instrument(level = "trace", skip_all)]
 fn sort_records<T, I>(
     records: I,
     disk_sort: bool,
@@ -172,7 +176,7 @@ where
         records.map(|record| record.map_err(io::Error::other)),
     ))
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 pub fn sort_gff<R: BufRead, W: Write>(mut reader: R, disk_sort: bool, mut writer: W) -> Result<()> {
     let mut comments = Vec::new();
     let mut fasta_line = None;
@@ -256,7 +260,7 @@ pub fn sort_gff<R: BufRead, W: Write>(mut reader: R, disk_sort: bool, mut writer
 
     Ok(())
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn write_gff_group<W: Write>(writer: &mut W, records: &[GffSortRecord]) -> Result<()> {
     for index in order_gff_tie_group(records)? {
         write_line(writer, &records[index].raw)?;
@@ -266,6 +270,7 @@ fn write_gff_group<W: Write>(writer: &mut W, records: &[GffSortRecord]) -> Resul
 }
 
 /// Sorts BED records by contig, start, and end position.
+#[tracing::instrument(level = "trace", skip_all)]
 pub fn sort_bed<R: BufRead, W: Write>(reader: R, disk_sort: bool, mut writer: W) -> Result<()> {
     let records = read_records(reader, |raw, line_number| {
         parse_bed_record(raw, line_number)
@@ -301,7 +306,7 @@ struct BedSortRecord {
     end: u64,
     source_index: usize,
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn parse_gff_record(raw: &[u8], line_number: usize) -> Result<GffSortRecord> {
     if raw.is_empty() || raw.iter().all(u8::is_ascii_whitespace) {
         return Err(invalid_line(
@@ -387,7 +392,7 @@ fn parse_gff_record(raw: &[u8], line_number: usize) -> Result<GffSortRecord> {
         source_index: line_number,
     })
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn parse_bed_record(raw: &[u8], line_number: usize) -> Result<BedSortRecord> {
     if raw.is_empty() || raw.iter().all(u8::is_ascii_whitespace) {
         return Err(invalid_line(
@@ -434,7 +439,7 @@ fn parse_bed_record(raw: &[u8], line_number: usize) -> Result<BedSortRecord> {
         source_index: line_number,
     })
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn parse_coordinate(value: &[u8], name: &str, format: &str, line_number: usize) -> Result<u64> {
     let value = std::str::from_utf8(value).map_err(|_| {
         invalid_line(
@@ -451,20 +456,20 @@ fn parse_coordinate(value: &[u8], name: &str, format: &str, line_number: usize) 
         )
     })
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn compare_gff_coordinates(left: &GffSortRecord, right: &GffSortRecord) -> Ordering {
     natord::compare_ignore_case(&left.contig, &right.contig)
         .then_with(|| left.start.cmp(&right.start))
         .then_with(|| left.end.cmp(&right.end))
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn compare_bed_records(left: &BedSortRecord, right: &BedSortRecord) -> Ordering {
     natord::compare_ignore_case(&left.contig, &right.contig)
         .then_with(|| left.start.cmp(&right.start))
         .then_with(|| left.end.cmp(&right.end))
         .then_with(|| left.source_index.cmp(&right.source_index))
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn order_gff_tie_group(records: &[GffSortRecord]) -> Result<Vec<usize>> {
     let mut id_to_records: HashMap<&[u8], Vec<usize>> = HashMap::new();
     for (index, record) in records.iter().enumerate() {
@@ -515,17 +520,17 @@ fn order_gff_tie_group(records: &[GffSortRecord]) -> Result<Vec<usize>> {
     }
     Ok(order)
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn strip_line_ending(line: &[u8]) -> &[u8] {
     let line = line.strip_suffix(b"\n").unwrap_or(line);
     line.strip_suffix(b"\r").unwrap_or(line)
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn write_line(writer: &mut impl Write, line: &[u8]) -> io::Result<()> {
     writer.write_all(line)?;
     writer.write_all(b"\n")
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn invalid_line(format: &str, line_number: usize, message: impl Into<String>) -> Error {
     Error::InvalidInput(format!("{format} line {line_number}: {}", message.into()))
 }

@@ -40,9 +40,14 @@ regex = "1.12"
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
 zstd = "0.13"
 flate2 = { version = "1.1.10", default-features = false, features = ["zlib-rs"] }
 natord = "1.0.9"
+
+[target.'cfg(unix)'.dependencies]
+pprof = { version = "0.15", default-features = false }
 
 [dev-dependencies]
 tempfile = "3.20"
@@ -64,7 +69,7 @@ test = false
 
 [profile.release]
 opt-level = 3
-strip = "symbols"
+strip = "debuginfo"
 lto = true
 codegen-units = 1
 panic = "abort"

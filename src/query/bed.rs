@@ -1,6 +1,6 @@
 use super::QueryReadContext;
 use crate::*;
-
+#[tracing::instrument(level = "trace", skip_all)]
 pub(super) fn read_bed_query_chunks(
     source: File,
     chunks: &[Chunk],
@@ -100,6 +100,7 @@ mod tests {
     use crate::index::tests::write_bed_fixture;
 
     #[test]
+    #[tracing::instrument(level = "trace", skip_all)]
     fn test_bed_name_index_builds_from_column_four() {
         let directory = tempdir().expect("should create temp directory");
         let (source, coordinate_index) = write_bed_fixture(directory.path());

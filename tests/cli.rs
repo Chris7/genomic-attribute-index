@@ -227,6 +227,29 @@ fn cli_index_query_and_inspect() {
     assert!(inspection.contains("postings compression"));
     assert!(inspection.contains("starts compression"));
     assert!(inspection.contains("lengths compression"));
+    assert!(!String::from_utf8_lossy(&inspected.stderr).contains("time.busy"));
+
+    let profiled = Command::new(binary)
+        .args(["profile", "inspect-index", &destination_string])
+        .output()
+        .expect("should run profiled inspect-index");
+    assert!(profiled.status.success(), "stderr: {:?}", profiled.stderr);
+    assert_eq!(profiled.stdout, inspected.stdout);
+    let profiling_stderr = String::from_utf8_lossy(&profiled.stderr);
+    assert!(profiling_stderr.contains("run"));
+    assert!(profiling_stderr.contains("time.busy"));
+
+    if cfg!(unix) {
+        let sampled = Command::new(binary)
+            .args(["profile", "--sample", "inspect-index", &destination_string])
+            .output()
+            .expect("should run sample-profiled inspect-index");
+        assert!(sampled.status.success(), "stderr: {:?}", sampled.stderr);
+        assert_eq!(sampled.stdout, inspected.stdout);
+        let sample_stderr = String::from_utf8_lossy(&sampled.stderr);
+        assert!(sample_stderr.contains("sampled CPU profile (100 Hz)"));
+        assert!(!sample_stderr.contains("time.busy"));
+    }
 
     let missing_attribute = Command::new(binary)
         .args([
@@ -250,6 +273,7 @@ fn cli_index_query_and_inspect() {
     assert!(help.contains("build-index"));
     assert!(help.contains("query-index"));
     assert!(help.contains("inspect-index"));
+    assert!(help.contains("profile"));
     assert!(!help.contains("gff"));
 
     let old_surface = Command::new(binary)

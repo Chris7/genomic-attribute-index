@@ -1,6 +1,6 @@
 use super::ExtractedRecord;
 use crate::*;
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn extract_gff_record(
     record: &gff::feature::RecordBuf,
     reference_ids: &HashMap<String, u32>,
@@ -40,7 +40,7 @@ fn extract_gff_record(
         terms,
     })
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 pub(super) fn extract_gff_line(
     raw: &[u8],
     line_number: usize,
@@ -77,6 +77,7 @@ mod tests {
     use crate::index::tests::{fixture_records, write_fixture};
 
     #[test]
+    #[tracing::instrument(level = "trace", skip_all)]
     fn test_coordinate_and_normalization_boundaries() {
         assert_eq!(gff_to_span(100, 150).unwrap(), (99, 51));
         assert!(gff_to_span(0, 1).is_err());
@@ -119,6 +120,7 @@ mod tests {
     }
 
     #[test]
+    #[tracing::instrument(level = "trace", skip_all)]
     fn test_coordinate_index_path_and_gff_header_validation() {
         let directory = tempdir().expect("should create temporary directory");
         let (source, coordinate_index) = write_fixture(directory.path());
@@ -178,6 +180,7 @@ mod tests {
     }
 
     #[test]
+    #[tracing::instrument(level = "trace", skip_all)]
     fn test_plain_gff_uses_the_same_streaming_parser() {
         let directory = tempdir().expect("should create temp directory");
         let (_bgzf_source, coordinate_index) = write_fixture(directory.path());

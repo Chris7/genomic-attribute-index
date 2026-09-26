@@ -27,6 +27,44 @@ enum Command {
     /// Display GAI format, normalization, fingerprint, and block metadata.
     #[command(name = "inspect-index")]
     Inspect(InspectArgs),
+    /// Profile one of the GAI commands with tracing or CPU sampling.
+    Profile(ProfileArgs),
+}
+
+#[derive(Debug, Args)]
+struct ProfileArgs {
+    /// Use low-frequency CPU sampling instead of tracing instrumentation.
+    #[arg(long)]
+    sample: bool,
+    #[command(subcommand)]
+    command: ProfileCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum ProfileCommand {
+    /// Sort GFF/GFF3 or BED records and write the result to stdout.
+    #[command(name = "sort")]
+    Sort(SortArgs),
+    /// Build a deterministic Genomic Attribute Index (GAI) for configured GFF3 attributes.
+    #[command(name = "build-index")]
+    Build(BuildIndexArgs),
+    /// Query configured GFF attributes or BED names through TBI/CSI and print records.
+    #[command(name = "query-index")]
+    Query(QueryIndexArgs),
+    /// Display GAI format, normalization, fingerprint, and block metadata.
+    #[command(name = "inspect-index")]
+    Inspect(InspectArgs),
+}
+
+impl From<ProfileCommand> for Command {
+    fn from(command: ProfileCommand) -> Self {
+        match command {
+            ProfileCommand::Sort(arguments) => Self::Sort(arguments),
+            ProfileCommand::Build(arguments) => Self::Build(arguments),
+            ProfileCommand::Query(arguments) => Self::Query(arguments),
+            ProfileCommand::Inspect(arguments) => Self::Inspect(arguments),
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -91,6 +129,7 @@ enum QueryMatch {
 }
 
 impl From<QueryMatch> for MatchMode {
+    #[tracing::instrument(level = "trace", skip_all)]
     fn from(value: QueryMatch) -> Self {
         match value {
             QueryMatch::Exact => Self::Exact,
@@ -106,7 +145,7 @@ struct InspectArgs {
     /// GAI path.
     input: PathBuf,
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn discover_coordinate_index(input: &std::path::Path) -> Result<PathBuf> {
     let tbi = PathBuf::from(format!("{}.tbi", input.display()));
     let csi = PathBuf::from(format!("{}.csi", input.display()));
@@ -125,7 +164,7 @@ fn discover_coordinate_index(input: &std::path::Path) -> Result<PathBuf> {
         ))),
     }
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Sort(arguments) => {
@@ -299,14 +338,19 @@ fn run(cli: Cli) -> Result<()> {
                 hex(&metadata.reference_dictionary_fingerprint)
             );
         }
+        Command::Profile(_) => {
+            return Err(gai::Error::InvalidInput(
+                "profile subcommands must be invoked through the profile command".into(),
+            ));
+        }
     }
     Ok(())
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
-
+#[tracing::instrument(level = "trace", skip_all)]
 fn compression_ratio(uncompressed: u64, compressed: u64) -> f64 {
     if compressed == 0 {
         0.0
@@ -315,12 +359,67 @@ fn compression_ratio(uncompressed: u64, compressed: u64) -> f64 {
     }
 }
 
-fn main() -> ExitCode {
-    match run(Cli::parse()) {
+#[cfg(unix)]
+#[tracing::instrument(level = "trace", skip_all)]
+fn run_with_sampling(cli: Cli) -> ExitCode {
+    let profiler = match pprof::ProfilerGuard::new(100) {
+        Ok(profiler) => profiler,
+        Err(error) => {
+            eprintln!("gai: could not start sample profiler: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let result = run(cli);
+    match profiler.report().build() {
+        Ok(report) => eprintln!("gai: sampled CPU profile (100 Hz):\n{report:?}"),
+        Err(error) => {
+            eprintln!("gai: could not collect sample profile: {error}");
+            return ExitCode::FAILURE;
+        }
+    }
+    exit_code(result)
+}
+
+#[tracing::instrument(level = "trace", skip_all)]
+fn exit_code(result: Result<()>) -> ExitCode {
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("gai: {error}");
             ExitCode::from(1)
         }
     }
+}
+
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    if let Command::Profile(profile) = cli.command {
+        let cli = Cli {
+            command: profile.command.into(),
+        };
+        if profile.sample {
+            #[cfg(unix)]
+            {
+                return run_with_sampling(cli);
+            }
+            #[cfg(not(unix))]
+            {
+                eprintln!("gai: sample profiling is only supported on Unix platforms");
+                return ExitCode::FAILURE;
+            }
+        }
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)
+            .with_writer(std::io::stderr)
+            .finish();
+        if let Err(error) = tracing::subscriber::set_global_default(subscriber) {
+            eprintln!("gai: could not initialize profiling: {error}");
+            return ExitCode::FAILURE;
+        }
+        return exit_code(run(cli));
+    }
+
+    exit_code(run(cli))
 }
