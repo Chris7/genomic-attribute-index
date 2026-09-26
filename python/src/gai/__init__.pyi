@@ -2,7 +2,7 @@ from pathlib import Path
 from typing import Iterable, Literal, Optional, Union
 
 PathLike = Union[str, Path]
-MatchMode = Literal["exact", "prefix"]
+MatchMode = Literal["exact", "prefix", "contains", "regex"]
 __version__: str
 
 class GaiError(Exception): ...
@@ -29,7 +29,7 @@ class IndexMetadata:
     minor_version: int
     case_sensitive: bool
     attributes: list[str]
-    gff_fingerprint: str
+    source_fingerprint: str
     coordinate_index_fingerprint: str
     reference_dictionary_fingerprint: str
     term_count: int
@@ -101,7 +101,7 @@ class QueryStats:
     matching_records: int
     bytes_read: int
 
-class IndexedGff:
+class IndexedSource:
     def metadata(self) -> IndexMetadata: ...
     def query(self, term: str, *, match: MatchMode = "exact") -> list[GffRecord]: ...
     def query_with_stats(
@@ -121,7 +121,7 @@ def build_index(
 ) -> BuildStats: ...
 def open_index(
     input: PathLike, coordinate_index: PathLike, gai: PathLike
-) -> IndexedGff: ...
+) -> IndexedSource: ...
 def query_index(
     input: PathLike,
     coordinate_index: PathLike,

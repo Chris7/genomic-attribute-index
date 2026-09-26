@@ -6,12 +6,16 @@ use std::{
 };
 
 use gai::{
-    BuildOptions, Error, GffRecord, IndexMetadata, IndexStats, IndexedGff, MatchMode,
-    NameIndexOptions, QueryStats, build_name_index_with_options, sort_file,
+    BuildOptions, Error, GffRecord, IndexMetadata, IndexStats, IndexedSource, MatchMode,
+    NameIndexOptions, QueryStats, SortFormat, build_name_index_with_options, sort_file,
 };
 use pyo3::{
-    Bound, PyResult, Python, create_exception, exceptions::PyException, prelude::PyModule, pyclass,
-    pyfunction, pymethods, pymodule, types::PyModuleMethods, wrap_pyfunction,
+    Bound, PyErr, PyResult, Python, create_exception,
+    exceptions::{PyException, PyUserWarning},
+    prelude::PyModule,
+    pyclass, pyfunction, pymethods, pymodule,
+    types::PyModuleMethods,
+    wrap_pyfunction,
 };
 
 create_exception!(
@@ -122,7 +126,7 @@ struct PyIndexMetadata {
     #[pyo3(get)]
     attributes: Vec<String>,
     #[pyo3(get)]
-    gff_fingerprint: String,
+    source_fingerprint: String,
     #[pyo3(get)]
     coordinate_index_fingerprint: String,
     #[pyo3(get)]
@@ -186,7 +190,7 @@ impl From<IndexMetadata> for PyIndexMetadata {
             minor_version: metadata.minor_version,
             case_sensitive: metadata.case_sensitive,
             attributes: metadata.attributes,
-            gff_fingerprint: hex(&metadata.gff_fingerprint),
+            source_fingerprint: hex(&metadata.source_fingerprint),
             coordinate_index_fingerprint: hex(&metadata.coordinate_index_fingerprint),
             reference_dictionary_fingerprint: hex(&metadata.reference_dictionary_fingerprint),
             term_count: metadata.term_count,
@@ -359,9 +363,9 @@ impl From<QueryStats> for PyQueryStats {
     }
 }
 
-#[pyclass(name = "IndexedGff")]
-struct PyIndexedGff {
-    inner: Mutex<IndexedGff>,
+#[pyclass(name = "IndexedSource")]
+struct PyIndexedSource {
+    inner: Mutex<IndexedSource>,
 }
 
 fn records(records: Vec<GffRecord>) -> Vec<PyGffRecord> {
@@ -372,8 +376,8 @@ fn open_inner(
     input: PathBuf,
     coordinate_index: PathBuf,
     gai: PathBuf,
-) -> Result<IndexedGff, Error> {
-    IndexedGff::open(input, coordinate_index, gai)
+) -> Result<IndexedSource, Error> {
+    IndexedSource::open(input, coordinate_index, gai)
 }
 
 fn parse_match_mode(value: &str) -> Result<MatchMode, Error> {
@@ -381,7 +385,7 @@ fn parse_match_mode(value: &str) -> Result<MatchMode, Error> {
 }
 
 #[pymethods]
-impl PyIndexedGff {
+impl PyIndexedSource {
     /// Return metadata after the source/index/GAI fingerprints were checked.
     fn metadata(&self) -> PyResult<PyIndexMetadata> {
         let guard = self
@@ -391,7 +395,8 @@ impl PyIndexedGff {
         Ok(guard.metadata().clone().into())
     }
 
-    /// Query one normalized configured attribute value.
+    /// Query configured values exactly, by prefix, by literal substring, or by regex.
+    /// Regex syntax is preserved and patterns are Unicode-aware searches.
     #[pyo3(signature = (term, *, r#match = "exact"))]
     fn query(&self, py: Python<'_>, term: &str, r#match: &str) -> PyResult<Vec<PyGffRecord>> {
         let term = term.to_owned();
@@ -429,7 +434,7 @@ impl PyIndexedGff {
     }
 
     fn __repr__(&self) -> String {
-        "IndexedGff(...)".to_string()
+        "IndexedSource(...)".to_string()
     }
 }
 
@@ -460,7 +465,24 @@ fn build_index(
     compression_threads: Option<usize>,
     bgzf_threads: Option<usize>,
 ) -> PyResult<PyBuildStats> {
-    let options = NameIndexOptions::new(attributes, case_sensitive).map_err(to_py_error)?;
+    let format = SortFormat::from_path(&input).map_err(to_py_error)?;
+    let options = match format {
+        SortFormat::Gff => {
+            NameIndexOptions::new(attributes, case_sensitive).map_err(to_py_error)?
+        }
+        SortFormat::Bed => {
+            if !attributes.is_empty() {
+                let warning = py.get_type::<PyUserWarning>();
+                PyErr::warn(
+                    py,
+                    &warning,
+                    c"attributes are ignored for BED input; BED indexes the name field (column 4)",
+                    1,
+                )?;
+            }
+            NameIndexOptions::bed(case_sensitive)
+        }
+    };
     let mut build_options = BuildOptions::default().with_memory_budget(memory_budget);
     if let Some(threads) = compression_threads {
         build_options = build_options.with_compression_threads(threads);
@@ -481,9 +503,9 @@ fn open_index(
     input: PathBuf,
     coordinate_index: PathBuf,
     gai: PathBuf,
-) -> PyResult<PyIndexedGff> {
+) -> PyResult<PyIndexedSource> {
     py.allow_threads(|| open_inner(input, coordinate_index, gai))
-        .map(|inner| PyIndexedGff {
+        .map(|inner| PyIndexedSource {
             inner: Mutex::new(inner),
         })
         .map_err(to_py_error)
@@ -527,7 +549,7 @@ fn _gai(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyIndexMetadata>()?;
     m.add_class::<PyBuildStats>()?;
     m.add_class::<PyQueryStats>()?;
-    m.add_class::<PyIndexedGff>()?;
+    m.add_class::<PyIndexedSource>()?;
     m.add_function(wrap_pyfunction!(sort, m)?)?;
     m.add_function(wrap_pyfunction!(build_index, m)?)?;
     m.add_function(wrap_pyfunction!(open_index, m)?)?;
