@@ -89,3 +89,28 @@ pub(crate) fn extract_bed_record(
         terms,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_bed_name_and_zero_based_span() {
+        let reference_ids = HashMap::from([(String::from("chr1"), 7)]);
+        let extracted = extract_bed_record(b"chr1\t10\t25\t Alpha ", 1, &reference_ids, false)
+            .expect("should extract BED name and span");
+        assert_eq!(
+            extracted.span,
+            SpanKey {
+                reference_id: 7,
+                start: 10,
+                length: 15,
+            }
+        );
+        assert_eq!(extracted.terms, vec!["alpha"]);
+
+        let unnamed = extract_bed_record(b"chr1\t25\t30", 2, &reference_ids, false)
+            .expect("should extract BED span without a name");
+        assert!(unnamed.terms.is_empty());
+    }
+}

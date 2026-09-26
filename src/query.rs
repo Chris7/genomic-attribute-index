@@ -1363,3 +1363,580 @@ pub(crate) fn read_query_chunks(
         SortFormat::Bed => bed::read_bed_query_chunks(source, chunks, context, stats),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::index::tests::{
+        mutate_section, mutate_section_directory_item_count, mutate_section_directory_offset,
+        write_fixture,
+    };
+
+    #[test]
+    fn test_corruption_is_an_error() {
+        let directory = tempdir().expect("should create temp directory");
+        let (source, coordinate_index) = write_fixture(directory.path());
+        let destination = directory.path().join("fixture.gai");
+        let options = NameIndexOptions::new(["Name"], false).expect("should validate attributes");
+        build_name_index(&source, &coordinate_index, &destination, &options)
+            .expect("should build GAI");
+        let mut bytes = fs::read(&destination).expect("should read GAI");
+        assert_eq!(&bytes[..4], b"GAI\x01");
+        let mut legacy_magic = bytes.clone();
+        legacy_magic[..4].copy_from_slice(&[b'G', b'N', b'I', 1]);
+        assert!(NameIndexReader::from_bytes(legacy_magic).is_err());
+        bytes[0] = b'X';
+        assert!(NameIndexReader::from_bytes(bytes).is_err());
+        let stale_source = directory.path().join("stale.gff3.gz");
+        fs::copy(&source, &stale_source).expect("should copy source");
+        let mut source_bytes = fs::read(&stale_source).expect("should read source");
+        source_bytes.push(0);
+        fs::write(&stale_source, source_bytes).expect("should alter source");
+        assert!(matches!(
+            IndexedSource::open(&stale_source, &coordinate_index, &destination),
+            Err(Error::Stale(_))
+        ));
+        let stale_coordinate_index = directory.path().join("stale.gff3.gz.tbi");
+        fs::copy(&coordinate_index, &stale_coordinate_index).expect("should copy TBI");
+        let mut coordinate_bytes = fs::read(&stale_coordinate_index).unwrap();
+        coordinate_bytes.push(0);
+        fs::write(&stale_coordinate_index, coordinate_bytes).unwrap();
+        assert!(IndexedSource::open(&source, &stale_coordinate_index, &destination).is_err());
+    }
+
+    #[test]
+    fn test_varint_boundaries_and_malformed_values() {
+        for value in [0, 1, 127, 128, 255, 16_384, u32::MAX as u64, u64::MAX] {
+            let mut bytes = Vec::new();
+            write_varint(&mut bytes, value);
+            let mut offset = 0;
+            assert_eq!(read_varint(&bytes, &mut offset, "test").unwrap(), value);
+            assert_eq!(offset, bytes.len());
+        }
+
+        let mut offset = 0;
+        assert!(read_varint(&[0x80; 10], &mut offset, "unterminated").is_err());
+        let mut overflowing = vec![0xff; 9];
+        overflowing.push(0x02);
+        offset = 0;
+        assert!(read_varint(&overflowing, &mut offset, "overflow").is_err());
+
+        let mut term_spans = BTreeMap::new();
+        term_spans.insert("term".to_string(), BTreeSet::from([1_u64, 4, 9]));
+        let (fst_bytes, directory, data, _) = encode_postings(&term_spans).unwrap();
+        assert_eq!(directory.len(), 1);
+        assert_eq!(directory[0].compression, 0);
+        assert_eq!(data, vec![3, 1, 3, 5]);
+        let map = fst::Map::new(&fst_bytes).unwrap();
+        let locator = map.get("term").unwrap();
+        assert_eq!(
+            decode_posting_record(&data, (locator & u64::from(u32::MAX)) as usize, 10).unwrap(),
+            vec![1, 4, 9]
+        );
+    }
+
+    #[test]
+    fn test_adaptive_span_encodings_round_trip() {
+        let example = [10_u64, 10, 15, 20]
+            .into_iter()
+            .map(|start| SpanKey {
+                reference_id: 0,
+                start,
+                length: 1,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(example[0].start, 10);
+        assert_eq!(encode_delta_start_payload(&example).unwrap(), vec![0, 5, 5]);
+
+        let packed_values = (0..64)
+            .map(|index| SpanKey {
+                reference_id: 7,
+                start: 1_000_000 + index / 2,
+                length: 100 + index % 3,
+            })
+            .collect::<Vec<_>>();
+        let packed_starts = encode_delta_start_payload(&packed_values).unwrap();
+        let (packed_lengths, packed_length_encoding) =
+            encode_length_payload(&packed_values).unwrap();
+        assert_eq!(
+            packed_length_encoding, 2,
+            "clustered lengths should use FOR"
+        );
+        let packed_entry = SpanDirectoryEntry {
+            first_span_id: 0,
+            span_count: packed_values.len() as u32,
+            reference_id: 7,
+            first_start: packed_values[0].start,
+            starts_compressed_offset: 0,
+            starts_compressed_length: packed_starts.len() as u32,
+            starts_uncompressed_length: packed_starts.len() as u32,
+            starts_checksum: checksum(&packed_starts),
+            lengths_compressed_offset: 0,
+            lengths_compressed_length: packed_lengths.len() as u32,
+            lengths_uncompressed_length: packed_lengths.len() as u32,
+            lengths_checksum: checksum(&packed_lengths),
+            start_encoding: START_ENCODING_DELTA,
+            length_encoding: packed_length_encoding,
+            starts_compression: 0,
+            lengths_compression: 0,
+        };
+        for (row, expected) in packed_values.iter().enumerate() {
+            assert_eq!(
+                decode_span_row(&packed_starts, &packed_lengths, &packed_entry, row).unwrap(),
+                Span::from(*expected)
+            );
+        }
+
+        let varint_values = vec![
+            SpanKey {
+                reference_id: 7,
+                start: 10,
+                length: 1,
+            },
+            SpanKey {
+                reference_id: 7,
+                start: 1_u64 << 40,
+                length: 1_u64 << 40,
+            },
+        ];
+        let varint_starts = encode_delta_start_payload(&varint_values).unwrap();
+        let (varint_lengths, varint_length_encoding) =
+            encode_length_payload(&varint_values).unwrap();
+        assert_eq!(
+            varint_length_encoding, 0,
+            "sparse lengths should use varints"
+        );
+        let varint_entry = SpanDirectoryEntry {
+            first_span_id: 0,
+            span_count: 2,
+            reference_id: 7,
+            first_start: varint_values[0].start,
+            starts_compressed_offset: 0,
+            starts_compressed_length: varint_starts.len() as u32,
+            starts_uncompressed_length: varint_starts.len() as u32,
+            starts_checksum: checksum(&varint_starts),
+            lengths_compressed_offset: 0,
+            lengths_compressed_length: varint_lengths.len() as u32,
+            lengths_uncompressed_length: varint_lengths.len() as u32,
+            lengths_checksum: checksum(&varint_lengths),
+            start_encoding: START_ENCODING_DELTA,
+            length_encoding: varint_length_encoding,
+            starts_compression: 0,
+            lengths_compression: 0,
+        };
+        for (row, expected) in varint_values.iter().enumerate() {
+            assert_eq!(
+                decode_span_row(&varint_starts, &varint_lengths, &varint_entry, row).unwrap(),
+                Span::from(*expected)
+            );
+        }
+
+        let equal_start_values = (0..4)
+            .map(|index| SpanKey {
+                reference_id: 7,
+                start: 77,
+                length: index + 1,
+            })
+            .collect::<Vec<_>>();
+        let equal_starts = encode_delta_start_payload(&equal_start_values).unwrap();
+        let equal_entry = SpanDirectoryEntry {
+            first_span_id: 0,
+            span_count: 4,
+            reference_id: 7,
+            first_start: 77,
+            starts_compressed_offset: 0,
+            starts_compressed_length: equal_starts.len() as u32,
+            starts_uncompressed_length: equal_starts.len() as u32,
+            starts_checksum: checksum(&equal_starts),
+            lengths_compressed_offset: 0,
+            lengths_compressed_length: 0,
+            lengths_uncompressed_length: 0,
+            lengths_checksum: 0,
+            start_encoding: START_ENCODING_DELTA,
+            length_encoding: 0,
+            starts_compression: 0,
+            lengths_compression: 0,
+        };
+        let (equal_lengths, equal_encoding) = encode_length_payload(&equal_start_values).unwrap();
+        let equal_entry = SpanDirectoryEntry {
+            lengths_compressed_length: equal_lengths.len() as u32,
+            lengths_uncompressed_length: equal_lengths.len() as u32,
+            lengths_checksum: checksum(&equal_lengths),
+            length_encoding: equal_encoding,
+            ..equal_entry
+        };
+        assert_eq!(
+            decode_span_rows(&equal_starts, &equal_lengths, &equal_entry)
+                .unwrap()
+                .iter()
+                .map(|span| span.start)
+                .collect::<Vec<_>>(),
+            vec![77; 4]
+        );
+
+        let values = [100_u64, 101, 103, 103];
+        let (packed, base, width) = encode_for_values(&values).unwrap();
+        assert_eq!(base, 100);
+        assert_eq!(width, 2);
+        let mut offset = 0;
+        assert_eq!(
+            decode_for_stream(
+                &packed,
+                &mut offset,
+                packed.len(),
+                values.len(),
+                base,
+                width,
+                "test"
+            )
+            .unwrap(),
+            values
+        );
+        assert_eq!(offset, packed.len());
+        let (empty, base, width) = encode_for_values(&[0, u64::MAX]).unwrap();
+        assert!(empty.is_empty());
+        assert_eq!((base, width), (0, 64));
+        assert!(decode_for_stream(&[], &mut 0, 0, 2, 0, 64, "overflow").is_err());
+    }
+
+    #[test]
+    fn test_delta_start_payload_rejects_malformed_payloads_without_unbounded_work() {
+        let values = [
+            SpanKey {
+                reference_id: 2,
+                start: 100,
+                length: 5,
+            },
+            SpanKey {
+                reference_id: 2,
+                start: 101,
+                length: 6,
+            },
+            SpanKey {
+                reference_id: 2,
+                start: 103,
+                length: 7,
+            },
+            SpanKey {
+                reference_id: 2,
+                start: 110,
+                length: 8,
+            },
+        ];
+        let starts = encode_delta_start_payload(&values).unwrap();
+        let (lengths, length_encoding) = encode_length_payload(&values).unwrap();
+        let entry = SpanDirectoryEntry {
+            first_span_id: 0,
+            span_count: values.len() as u32,
+            reference_id: 2,
+            first_start: 100,
+            starts_compressed_offset: 0,
+            starts_compressed_length: starts.len() as u32,
+            starts_uncompressed_length: starts.len() as u32,
+            starts_checksum: checksum(&starts),
+            lengths_compressed_offset: 0,
+            lengths_compressed_length: lengths.len() as u32,
+            lengths_uncompressed_length: lengths.len() as u32,
+            lengths_checksum: checksum(&lengths),
+            start_encoding: START_ENCODING_DELTA,
+            length_encoding,
+            starts_compression: 0,
+            lengths_compression: 0,
+        };
+        assert!(decode_delta_start_payload(&starts, &entry).is_ok());
+
+        let mut truncated = starts.clone();
+        truncated.pop();
+        assert!(decode_delta_start_payload(&truncated, &entry).is_err());
+
+        let mut trailing = starts.clone();
+        trailing.push(0);
+        assert!(decode_delta_start_payload(&trailing, &entry).is_err());
+
+        // One-byte deltas are required to use their minimal LEB128 form.
+        let noncanonical = vec![0x81, 0x00, 0x02, 0x07];
+        assert!(decode_delta_start_payload(&noncanonical, &entry).is_err());
+        assert!(decode_delta_start_payload(&[0x80], &entry).is_err());
+
+        let mut count_mismatch = entry.clone();
+        count_mismatch.span_count = 3;
+        assert!(decode_delta_start_payload(&starts, &count_mismatch).is_err());
+
+        let mut overflowing_start = entry.clone();
+        overflowing_start.first_start = u64::MAX;
+        assert!(decode_delta_start_payload(&starts, &overflowing_start).is_err());
+
+        let mut bad_lengths = lengths.clone();
+        bad_lengths[0..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(decode_length_payload(&bad_lengths, &entry).is_err());
+        assert!(decode_span_rows(&starts, &lengths, &entry).is_ok());
+
+        let single = [SpanKey {
+            reference_id: 2,
+            start: 42,
+            length: 9,
+        }];
+        let single_starts = encode_delta_start_payload(&single).unwrap();
+        assert!(single_starts.is_empty());
+        let (single_lengths, single_encoding) = encode_length_payload(&single).unwrap();
+        let single_entry = SpanDirectoryEntry {
+            first_span_id: 0,
+            span_count: 1,
+            reference_id: 2,
+            first_start: 42,
+            starts_compressed_offset: 0,
+            starts_compressed_length: single_starts.len() as u32,
+            starts_uncompressed_length: single_starts.len() as u32,
+            starts_checksum: checksum(&single_starts),
+            lengths_compressed_offset: 0,
+            lengths_compressed_length: single_lengths.len() as u32,
+            lengths_uncompressed_length: single_lengths.len() as u32,
+            lengths_checksum: checksum(&single_lengths),
+            start_encoding: START_ENCODING_DELTA,
+            length_encoding: single_encoding,
+            starts_compression: 0,
+            lengths_compression: 0,
+        };
+        assert_eq!(
+            decode_span_rows(&single_starts, &single_lengths, &single_entry).unwrap(),
+            vec![Span::from(single[0])]
+        );
+        assert!(decode_delta_start_payload(&[0], &single_entry).is_err());
+    }
+
+    #[test]
+    fn test_attribute_and_data_section_item_counts_are_validated() {
+        let directory = tempdir().expect("should create temp directory");
+        let (source, coordinate_index) = write_fixture(directory.path());
+        let destination = directory.path().join("counts.gai");
+        build_name_index(
+            &source,
+            &coordinate_index,
+            &destination,
+            &NameIndexOptions::new(["Name"], false).unwrap(),
+        )
+        .unwrap();
+        let original = fs::read(&destination).unwrap();
+
+        let mut empty_attribute = original.clone();
+        mutate_section(&mut empty_attribute, SectionKind::Attributes, |section| {
+            section[4..8].copy_from_slice(&0_u32.to_le_bytes());
+        });
+        assert!(matches!(
+            NameIndexReader::from_bytes(empty_attribute),
+            Err(Error::Corrupt(message)) if message.contains("attribute")
+        ));
+
+        let two_attribute_destination = directory.path().join("two-attributes.gai");
+        build_name_index(
+            &source,
+            &coordinate_index,
+            &two_attribute_destination,
+            &NameIndexOptions::new(["Name", "Type"], false).unwrap(),
+        )
+        .unwrap();
+        let mut duplicate_attribute = fs::read(&two_attribute_destination).unwrap();
+        mutate_section(
+            &mut duplicate_attribute,
+            SectionKind::Attributes,
+            |section| {
+                let first_length = u32::from_le_bytes(section[4..8].try_into().unwrap()) as usize;
+                let second_offset = 8 + first_length;
+                let second_length = u32::from_le_bytes(
+                    section[second_offset..second_offset + 4]
+                        .try_into()
+                        .unwrap(),
+                ) as usize;
+                assert_eq!(first_length, second_length);
+                let first = section[8..8 + first_length].to_vec();
+                section[second_offset + 4..second_offset + 4 + second_length]
+                    .copy_from_slice(&first);
+            },
+        );
+        assert!(matches!(
+            NameIndexReader::from_bytes(duplicate_attribute),
+            Err(Error::Corrupt(message)) if message.contains("attribute")
+        ));
+
+        let mut bad_postings_items = original.clone();
+        mutate_section_directory_item_count(
+            &mut bad_postings_items,
+            SectionKind::PostingsData,
+            u64::MAX,
+        );
+        assert!(matches!(
+            NameIndexReader::from_bytes(bad_postings_items),
+            Err(Error::Corrupt(message)) if message.contains("PostingsData")
+        ));
+
+        let mut bad_spans_items = original;
+        mutate_section_directory_item_count(
+            &mut bad_spans_items,
+            SectionKind::StartsData,
+            u64::MAX,
+        );
+        assert!(matches!(
+            NameIndexReader::from_bytes(bad_spans_items),
+            Err(Error::Corrupt(message)) if message.contains("StartsData")
+        ));
+    }
+
+    #[test]
+    fn test_corruption_classes_are_rejected_or_bounded() {
+        let directory = tempdir().unwrap();
+        let (source, coordinate_index) = write_fixture(directory.path());
+        let destination = directory.path().join("corruptions.gai");
+        build_name_index(
+            &source,
+            &coordinate_index,
+            &destination,
+            &NameIndexOptions::new(["Name"], false).unwrap(),
+        )
+        .unwrap();
+        let original = fs::read(&destination).unwrap();
+
+        let mut truncated = original.clone();
+        truncated.truncate(truncated.len() - 1);
+        assert!(NameIndexReader::from_bytes(truncated).is_err());
+
+        let mut bad_offset = original.clone();
+        mutate_section_directory_offset(&mut bad_offset, SectionKind::Terms, u64::MAX);
+        assert!(NameIndexReader::from_bytes(bad_offset).is_err());
+
+        let mut bad_version = original.clone();
+        bad_version[4..6].copy_from_slice(&2_u16.to_le_bytes());
+        assert!(NameIndexReader::from_bytes(bad_version).is_err());
+
+        let mut bad_count = original.clone();
+        mutate_section_directory_item_count(&mut bad_count, SectionKind::Terms, u64::MAX);
+        assert!(NameIndexReader::from_bytes(bad_count).is_err());
+
+        let mut bad_checksum = original.clone();
+        mutate_section(&mut bad_checksum, SectionKind::Attributes, |section| {
+            section[section.len() - 1] ^= 1;
+        });
+        // Restoring the section checksum above models a valid directory with
+        // damaged payload; an un-restored checksum is checked at open time.
+        let mut untrusted_checksum = original.clone();
+        mutate_section(
+            &mut untrusted_checksum,
+            SectionKind::Attributes,
+            |section| {
+                section[section.len() - 1] ^= 1;
+            },
+        );
+        // mutate_section refreshes the checksum, so explicitly damage it for
+        // the section-level checksum case.
+        let directory_offset = usize::try_from(u64::from_le_bytes(
+            untrusted_checksum[176..184].try_into().unwrap(),
+        ))
+        .unwrap();
+        untrusted_checksum[directory_offset + 32] ^= 1;
+        assert!(NameIndexReader::from_bytes(untrusted_checksum).is_err());
+        assert!(NameIndexReader::from_bytes(bad_checksum).is_ok());
+
+        let mut bad_postings_payload = original.clone();
+        mutate_section(
+            &mut bad_postings_payload,
+            SectionKind::PostingsData,
+            |section| {
+                if !section.is_empty() {
+                    section[0] ^= 0xff;
+                }
+            },
+        );
+        let posting_reader = NameIndexReader::from_bytes(bad_postings_payload).unwrap();
+        assert!(posting_reader.lookup_span_ids("brca1").is_err());
+
+        let mut bad_decompressed_size = original.clone();
+        mutate_section(
+            &mut bad_decompressed_size,
+            SectionKind::PostingsDirectory,
+            |section| {
+                let current = u32::from_le_bytes(section[12..16].try_into().unwrap());
+                section[12..16].copy_from_slice(&current.saturating_add(1).to_le_bytes());
+            },
+        );
+        let size_reader = NameIndexReader::from_bytes(bad_decompressed_size).unwrap();
+        assert!(size_reader.lookup_span_ids("brca1").is_err());
+
+        for component in [SectionKind::StartsData, SectionKind::LengthsData] {
+            let mut damaged_component = original.clone();
+            mutate_section(&mut damaged_component, component, |section| {
+                assert!(!section.is_empty());
+                section[0] ^= 0xff;
+            });
+            let component_reader = NameIndexReader::from_bytes(damaged_component).unwrap();
+            assert!(component_reader.resolve_span_id(0).is_err());
+        }
+
+        let mut bad_span_ref = original.clone();
+        mutate_section(&mut bad_span_ref, SectionKind::SpansDirectory, |section| {
+            section[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
+        });
+        let bad_span_destination = directory.path().join("bad-span-ref.gai");
+        fs::write(&bad_span_destination, &bad_span_ref).unwrap();
+        assert!(matches!(
+            IndexedSource::open(&source, &coordinate_index, &bad_span_destination),
+            Err(Error::Corrupt(_))
+        ));
+
+        let mut bad_reference_count = original.clone();
+        bad_reference_count[200..204].copy_from_slice(&3_u32.to_le_bytes());
+        let bad_reference_count_destination = directory.path().join("bad-reference-count.gai");
+        fs::write(&bad_reference_count_destination, &bad_reference_count).unwrap();
+        assert!(matches!(
+            IndexedSource::open(&source, &coordinate_index, &bad_reference_count_destination),
+            Err(Error::Corrupt(_))
+        ));
+
+        assert!(decode_posting_record(&[0x80; 10], 0, 1).is_err());
+        let mut excessive_count = Vec::new();
+        write_varint(&mut excessive_count, 100_000_001);
+        assert!(decode_posting_record(&excessive_count, 0, 1).is_err());
+        let mut invalid_span_id = Vec::new();
+        write_varint(&mut invalid_span_id, 1);
+        write_varint(&mut invalid_span_id, 1);
+        assert!(decode_posting_record(&invalid_span_id, 0, 1).is_err());
+        assert!(decode_for_stream(&[0], &mut 0, 1, 1, 0, 64, "bit width").is_err());
+        assert!(
+            Span {
+                reference_id: 0,
+                start: u64::MAX,
+                length: 1,
+            }
+            .end()
+            .is_err()
+        );
+
+        let bad_source = directory.path().join("bad.gff3");
+        fs::write(&bad_source, b"not a GFF record\n").unwrap();
+        let atomic_destination = directory.path().join("atomic.gai");
+        fs::write(&atomic_destination, b"previous valid output").unwrap();
+        assert!(
+            build_name_index(
+                &bad_source,
+                &coordinate_index,
+                &atomic_destination,
+                &NameIndexOptions::new(["Name"], false).unwrap(),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            fs::read(&atomic_destination).unwrap(),
+            b"previous valid output"
+        );
+
+        for length in 0..256_usize {
+            let bytes = (0..length)
+                .map(|index| (index as u8).wrapping_mul(37))
+                .collect::<Vec<_>>();
+            assert!(
+                std::panic::catch_unwind(|| NameIndexReader::from_bytes(bytes)).is_ok(),
+                "random corruption length {length} panicked"
+            );
+        }
+    }
+}

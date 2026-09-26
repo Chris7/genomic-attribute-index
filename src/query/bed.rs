@@ -91,3 +91,124 @@ pub(super) fn read_bed_query_chunks(
     }
     Ok(records)
 }
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::index::tests::write_bed_fixture;
+
+    #[test]
+    fn test_bed_name_index_builds_from_column_four() {
+        let directory = tempdir().expect("should create temp directory");
+        let (source, coordinate_index) = write_bed_fixture(directory.path());
+        let destination = directory.path().join("fixture-bed.gai");
+
+        // BED ignores configured GFF attributes and always indexes column 4 (`name`).
+        let options = NameIndexOptions::new(["DefinitelyIgnored"], false).unwrap();
+        let stats = build_name_index(&source, &coordinate_index, &destination, &options)
+            .expect("should build BED GAI");
+        assert_eq!(stats.records_processed, 4);
+        assert_eq!(stats.records_indexed, 3);
+        assert_eq!(stats.distinct_terms, 2);
+        assert_eq!(stats.unique_spans, 3);
+
+        let reader = NameIndexReader::open(&destination).expect("should open BED GAI");
+        assert_eq!(reader.metadata().attributes, vec!["name"]);
+        assert_eq!(reader.lookup_span_ids("alpha").unwrap(), vec![0, 2]);
+        assert_eq!(reader.lookup_span_ids("beta").unwrap(), vec![1]);
+        assert!(
+            reader
+                .lookup_span_ids("DefinitelyIgnored")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(reader.resolve_span_id(0).unwrap().start, 0);
+        assert_eq!(reader.resolve_span_id(0).unwrap().length, 10);
+        assert_eq!(reader.resolve_span_id(1).unwrap().start, 20);
+        assert_eq!(reader.resolve_span_id(1).unwrap().length, 5);
+
+        let case_destination = directory.path().join("fixture-bed-case.gai");
+        let case_options = NameIndexOptions::new(["Ignored"], true).unwrap();
+        build_name_index(&source, &coordinate_index, &case_destination, &case_options)
+            .expect("should build case-sensitive BED GAI");
+        let case_reader = NameIndexReader::open(&case_destination).unwrap();
+        assert_eq!(case_reader.lookup_span_ids("Alpha").unwrap(), vec![0, 2]);
+        assert!(case_reader.lookup_span_ids("alpha").unwrap().is_empty());
+
+        let mut indexed = IndexedSource::open(&source, &coordinate_index, &destination)
+            .expect("should open BED indexed source");
+        let records = indexed.query_name("alpha").expect("should query BED name");
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.raw_line.as_str())
+                .collect::<Vec<_>>(),
+            vec!["chr1\t0\t10\tAlpha", "chr2\t5\t7\tAlpha"]
+        );
+        assert_eq!(records[0].start, 1);
+        assert_eq!(records[0].end, 10);
+        assert_eq!(
+            records[0].attribute_values("name").collect::<Vec<_>>(),
+            vec!["Alpha"]
+        );
+        let prefix = indexed
+            .query_name_with_mode("al", MatchMode::Prefix)
+            .expect("should query BED name prefix");
+        assert_eq!(prefix.len(), 2);
+
+        let (contains, contains_stats) = indexed
+            .query_name_with_mode_and_stats(" ph ", MatchMode::Contains)
+            .expect("should query BED name substring");
+        assert_eq!(contains.len(), 2);
+        assert_eq!(contains_stats.requested_spans, 2);
+        assert_eq!(contains_stats.matching_records, 2);
+
+        let (regex, regex_stats) = indexed
+            .query_name_with_mode_and_stats("^(ALPHA|BETA)$", MatchMode::Regex)
+            .expect("should query BED name regex");
+        assert_eq!(regex.len(), 3);
+        assert_eq!(regex_stats.matching_records, 3);
+        let (class_regex, _) = indexed
+            .query_name_with_mode_and_stats("^ALP[A-Z]+$", MatchMode::Regex)
+            .expect("should query BED regex character class");
+        assert_eq!(class_regex.len(), 2);
+        let (escape_regex, _) = indexed
+            .query_name_with_mode_and_stats(r"\S", MatchMode::Regex)
+            .expect("should preserve BED regex uppercase escape");
+        assert_eq!(escape_regex.len(), 3);
+        assert!(
+            indexed
+                .query_name_with_mode("^missing$", MatchMode::Regex)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(matches!(
+            indexed.query_name_with_mode("missing[", MatchMode::Regex),
+            Err(Error::InvalidInput(message)) if message.contains("regex")
+        ));
+
+        let mut case_indexed = IndexedSource::open(&source, &coordinate_index, &case_destination)
+            .expect("should open case-sensitive BED GAI");
+        assert_eq!(
+            case_indexed
+                .query_name_with_mode("^Alpha$", MatchMode::Regex)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(
+            case_indexed
+                .query_name_with_mode("^alpha$", MatchMode::Regex)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            case_indexed
+                .query_name_with_mode("PH", MatchMode::Contains)
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
