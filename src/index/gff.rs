@@ -1,31 +1,42 @@
 use super::ExtractedRecord;
 use crate::*;
 #[cfg_attr(feature = "profiling", tracing::instrument(level = "trace", skip_all))]
-fn extract_gff_record(
-    record: &gff::feature::RecordBuf,
+fn extract_gff_record<R>(
+    record: &R,
     reference_ids: &HashMap<String, u32>,
     configured: &HashSet<String>,
     case_sensitive: bool,
-) -> Result<ExtractedRecord> {
-    let reference_sequence_name = String::from_utf8(record.reference_sequence_name().to_vec())
-        .map_err(|_| Error::InvalidInput("reference sequence name is not UTF-8".into()))?;
-    let reference_id = *reference_ids.get(&reference_sequence_name).ok_or_else(|| {
+) -> Result<ExtractedRecord>
+where
+    R: gff::feature::Record + ?Sized,
+{
+    let reference_sequence_name =
+        std::str::from_utf8(<_ as AsRef<[u8]>>::as_ref(record.reference_sequence_name()))
+            .map_err(|_| Error::InvalidInput("reference sequence name is not UTF-8".into()))?;
+    let reference_id = *reference_ids.get(reference_sequence_name).ok_or_else(|| {
         Error::InvalidInput(format!(
             "GFF reference sequence {reference_sequence_name:?} is absent from coordinate index"
         ))
     })?;
-    let (start, length) = gff_to_span(record.start().get() as u64, record.end().get() as u64)?;
+    let start = record.feature_start()?;
+    let end = record.feature_end()?;
+    record.score().transpose()?;
+    record.strand()?;
+    record.phase().transpose()?;
+    let (start, length) = gff_to_span(start.get() as u64, end.get() as u64)?;
     let mut terms = Vec::new();
-    for (tag, value) in record.attributes().as_ref() {
-        let tag = std::str::from_utf8(tag.as_ref())
+    for result in record.attributes().iter() {
+        let (tag, value) = result?;
+        let tag = std::str::from_utf8(tag.as_ref().as_ref())
             .map_err(|_| Error::InvalidInput("GFF attribute tag is not UTF-8".into()))?;
         if !configured.contains(tag) {
             continue;
         }
-        for value in value.iter() {
-            let value = String::from_utf8(<_ as AsRef<[u8]>>::as_ref(value).to_vec())
+        for result in value.iter() {
+            let value = result?;
+            let value = std::str::from_utf8(value.as_ref().as_ref())
                 .map_err(|_| Error::InvalidInput("GFF attribute value is not UTF-8".into()))?;
-            let normalized = normalize_value(&value, case_sensitive);
+            let normalized = normalize_value(value, case_sensitive);
             if !normalized.is_empty() {
                 terms.push(normalized);
             }
@@ -40,6 +51,17 @@ fn extract_gff_record(
         terms,
     })
 }
+
+fn invalid_record_at_line(line_number: usize, error: Error) -> Error {
+    let message = match error {
+        Error::InvalidInput(message) => message,
+        error => error.to_string(),
+    };
+    Error::InvalidInput(format!(
+        "invalid GFF record at line {line_number}: {message}"
+    ))
+}
+
 #[cfg_attr(feature = "profiling", tracing::instrument(level = "trace", skip_all))]
 pub(super) fn extract_gff_line(
     raw: &[u8],
@@ -50,23 +72,16 @@ pub(super) fn extract_gff_line(
 ) -> Result<ExtractedRecord> {
     let mut parser = gff::io::Reader::new(Cursor::new(raw));
     let mut line = gff::Line::default();
-    parser.read_line(&mut line).map_err(|error| {
-        Error::InvalidInput(format!("invalid GFF record at line {line_number}: {error}"))
-    })?;
+    parser
+        .read_line(&mut line)
+        .map_err(|error| invalid_record_at_line(line_number, Error::Io(error)))?;
     let record = line
         .as_record()
-        .ok_or_else(|| {
-            Error::InvalidInput(format!(
-                "invalid GFF record at line {line_number}: expected a feature record"
-            ))
-        })?
-        .map_err(|error| {
-            Error::InvalidInput(format!("invalid GFF record at line {line_number}: {error}"))
-        })?;
-    let record = gff::feature::RecordBuf::try_from_feature_record(&record).map_err(|error| {
-        Error::InvalidInput(format!("invalid GFF record at line {line_number}: {error}"))
-    })?;
+        .ok_or_else(|| Error::InvalidInput("expected a feature record".into()))
+        .and_then(|result| result.map_err(Error::Io))
+        .map_err(|error| invalid_record_at_line(line_number, error))?;
     extract_gff_record(&record, reference_ids, configured, case_sensitive)
+        .map_err(|error| invalid_record_at_line(line_number, error))
 }
 
 #[cfg(test)]
@@ -117,6 +132,21 @@ mod tests {
                 .unwrap(),
             vec![0, 2]
         );
+    }
+
+    #[test]
+    fn test_record_extraction_errors_include_line_number() {
+        let reference_ids = HashMap::from([("chr1".to_string(), 0)]);
+        let error = extract_gff_line(
+            b"chr1\tsrc\tgene\t0\t20\t.\t+\t.\t.",
+            17,
+            &reference_ids,
+            &HashSet::new(),
+            false,
+        )
+        .expect_err("zero-based GFF position should fail");
+
+        assert!(error.to_string().contains("invalid GFF record at line 17"));
     }
 
     #[test]
