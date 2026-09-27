@@ -132,9 +132,10 @@ fn run(cli: Cli) -> Result<()> {
             sort_file(arguments.input, arguments.disk_sort, std::io::stdout())?;
         }
         Command::Build(arguments) => {
-            let coordinate_index = arguments
-                .coordinate_index
-                .unwrap_or(discover_coordinate_index(&arguments.input)?);
+            let coordinate_index = match arguments.coordinate_index {
+                Some(path) => path,
+                None => discover_coordinate_index(&arguments.input)?,
+            };
             let output = arguments
                 .output
                 .unwrap_or_else(|| PathBuf::from(format!("{}.gai", arguments.input.display())));
@@ -198,9 +199,10 @@ fn run(cli: Cli) -> Result<()> {
             );
         }
         Command::Query(arguments) => {
-            let coordinate_index = arguments
-                .coordinate_index
-                .unwrap_or(discover_coordinate_index(&arguments.input)?);
+            let coordinate_index = match arguments.coordinate_index {
+                Some(path) => path,
+                None => discover_coordinate_index(&arguments.input)?,
+            };
             let gai = arguments
                 .gai
                 .unwrap_or_else(|| PathBuf::from(format!("{}.gai", arguments.input.display())));
