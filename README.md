@@ -112,31 +112,42 @@ progress callback without any library-level stderr output.
 
 ## Benchmarks
 
-See [benchmarking documentation](docs/benchmarking.md) for the reproducible script and query-mode
-comparisons across GFF3 and BED indexes.
+Run [`scripts/benchmark_index.sh`](scripts/benchmark_index.sh) with
+`./scripts/benchmark_index.sh > benchmark-results.md` to reproduce these tables. The input files
+are compressed BGZF files; reported sizes use decimal MB. Indexes use the default case-insensitive
+matching. Timings are single-run wall-clock measurements. Index build timings exclude compilation;
+query timings include the complete CLI invocation, including index opening, source fingerprint
+validation, and captured output.
 
-All files are in compressed bgzip format.
+### Index build results
 
-Index build time
+| Index / file | Attributes indexed | Raw compressed file size (MB) | Index size (MB) | Build time |
+| :--- | :--- | ---: | ---: | ---: |
+| gencode_sorted.gff.gz | gene_name | 83.53 | 4.17 | 8.622s |
+| gencode_sorted.gff.gz | gene_name, transcript_name | 83.53 | 7.28 | 10.896s |
+| gencode_sorted.gff.gz | ID, gene_name, transcript_name | 83.53 | 22.01 | 15.899s |
+| gencode_v46.bed.gz | name | 10.34 | 3.27 | 0.437s |
 
-| File | Attributes | Anntoation File Size | Index Size |
-| :--- | ---: | ---: | ---: |
-| Gencode v46 GFF | gene_name | 83.53 mb | 4.17 mb |
-| Gencode v46 GFF | gene_name,hgnc_id | 83.53 mb | 4.63 mb |
-| Gencode v46 Bed | name | 10.34 mb | 3.27 mb |
+### Query results
 
-Query time
-
-| Index | Attributes | Query | Query Type | Matching Records | Query Time |
-| :--- | ---: | ---: | ---: |
-| Gencode v46 GFF | gene_name | brca1 | exact | 1436 | 0.088s |
-| Gencode v46 GFF | gene_name | brca | prefix | 2312 | 0.099s |
-| Gencode v46 GFF | gene_name,hgnc_id | brca1 | exact | 1436 | 0.078s |
-| Gencode v46 GFF | gene_name,hgnc_id | brca | prefix | 2312 | 0.107s |
-| Gencode v46 GFF | gene_name,hgnc_id | hgnc:1001 | exact | 154 | 0.073s |
-| Gencode v46 GFF | gene_name,hgnc_id | hgnc:1001 | prefix | 915 | 0.120s |
-| Gencode v46 Bed | name | ENST00000607096.1 | exact | 1 | 0.022s |
-| Gencode v46 Bed | name | ENST000006070 | prefix | 50 | 0.104s |
+| Index queried | Attributes indexed | Query type | Query | Records matched | Query time |
+| :--- | :--- | :--- | :--- | ---: | ---: |
+| gencode_sorted.gff.gz | gene_name | exact | `brca1` | 1436 | 0.088s |
+| gencode_sorted.gff.gz | gene_name | contains | `orf` | 16797 | 1.205s |
+| gencode_sorted.gff.gz | gene_name | prefix | `brca` | 2312 | 0.120s |
+| gencode_sorted.gff.gz | gene_name | regex | `c\d+orf` | 16033 | 1.153s |
+| gencode_sorted.gff.gz | gene_name, transcript_name | exact | `brca1` | 1436 | 0.110s |
+| gencode_sorted.gff.gz | gene_name, transcript_name | contains | `orf` | 16797 | 1.223s |
+| gencode_sorted.gff.gz | gene_name, transcript_name | prefix | `brca` | 2312 | 0.107s |
+| gencode_sorted.gff.gz | gene_name, transcript_name | regex | `c\d+orf` | 16033 | 1.192s |
+| gencode_sorted.gff.gz | ID, gene_name, transcript_name | exact | `brca1` | 1436 | 0.099s |
+| gencode_sorted.gff.gz | ID, gene_name, transcript_name | contains | `orf` | 16797 | 1.415s |
+| gencode_sorted.gff.gz | ID, gene_name, transcript_name | prefix | `brca` | 2312 | 0.108s |
+| gencode_sorted.gff.gz | ID, gene_name, transcript_name | regex | `c\d+orf` | 16033 | 1.413s |
+| gencode_v46.bed.gz | name | exact | `ENST00000607096.1` | 1 | 0.039s |
+| gencode_v46.bed.gz | name | contains | `607096` | 1 | 0.077s |
+| gencode_v46.bed.gz | name | prefix | `ENST000006070` | 50 | 0.105s |
+| gencode_v46.bed.gz | name | regex | `^ENST00000607096\.1$` | 1 | 0.067s |
 
 
 ## Python API
