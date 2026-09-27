@@ -6,6 +6,9 @@ use gai::{
     build_name_index_with_options, sort_file,
 };
 
+#[cfg(feature = "profiling")]
+mod profiling;
+
 #[derive(Debug, Parser)]
 #[command(name = "gai", about = "GFF3 indexing and attribute-name queries")]
 struct Cli {
@@ -27,6 +30,48 @@ enum Command {
     /// Display GAI format, normalization, fingerprint, and block metadata.
     #[command(name = "inspect-index")]
     Inspect(InspectArgs),
+    #[cfg(feature = "profiling")]
+    /// Profile one of the GAI commands with tracing or CPU sampling.
+    Profile(ProfileArgs),
+}
+
+#[cfg(feature = "profiling")]
+#[derive(Debug, Args)]
+struct ProfileArgs {
+    /// Use low-frequency CPU sampling instead of tracing instrumentation.
+    #[arg(long)]
+    sample: bool,
+    #[command(subcommand)]
+    command: ProfileCommand,
+}
+
+#[cfg(feature = "profiling")]
+#[derive(Debug, Subcommand)]
+enum ProfileCommand {
+    /// Sort GFF/GFF3 or BED records and write the result to stdout.
+    #[command(name = "sort")]
+    Sort(SortArgs),
+    /// Build a deterministic Genomic Attribute Index (GAI) for configured GFF3 attributes.
+    #[command(name = "build-index")]
+    Build(BuildIndexArgs),
+    /// Query configured GFF attributes or BED names through TBI/CSI and print records.
+    #[command(name = "query-index")]
+    Query(QueryIndexArgs),
+    /// Display GAI format, normalization, fingerprint, and block metadata.
+    #[command(name = "inspect-index")]
+    Inspect(InspectArgs),
+}
+
+#[cfg(feature = "profiling")]
+impl From<ProfileCommand> for Command {
+    fn from(command: ProfileCommand) -> Self {
+        match command {
+            ProfileCommand::Sort(arguments) => Self::Sort(arguments),
+            ProfileCommand::Build(arguments) => Self::Build(arguments),
+            ProfileCommand::Query(arguments) => Self::Query(arguments),
+            ProfileCommand::Inspect(arguments) => Self::Inspect(arguments),
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -91,6 +136,7 @@ enum QueryMatch {
 }
 
 impl From<QueryMatch> for MatchMode {
+    #[cfg_attr(feature = "profiling", tracing::instrument(level = "trace", skip_all))]
     fn from(value: QueryMatch) -> Self {
         match value {
             QueryMatch::Exact => Self::Exact,
@@ -106,7 +152,7 @@ struct InspectArgs {
     /// GAI path.
     input: PathBuf,
 }
-
+#[cfg_attr(feature = "profiling", tracing::instrument(level = "trace", skip_all))]
 fn discover_coordinate_index(input: &std::path::Path) -> Result<PathBuf> {
     let tbi = PathBuf::from(format!("{}.tbi", input.display()));
     let csi = PathBuf::from(format!("{}.csi", input.display()));
@@ -125,7 +171,7 @@ fn discover_coordinate_index(input: &std::path::Path) -> Result<PathBuf> {
         ))),
     }
 }
-
+#[cfg_attr(feature = "profiling", tracing::instrument(level = "trace", skip_all))]
 fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Sort(arguments) => {
@@ -299,14 +345,20 @@ fn run(cli: Cli) -> Result<()> {
                 hex(&metadata.reference_dictionary_fingerprint)
             );
         }
+        #[cfg(feature = "profiling")]
+        Command::Profile(_) => {
+            return Err(gai::Error::InvalidInput(
+                "profile subcommands must be invoked through the profile command".into(),
+            ));
+        }
     }
     Ok(())
 }
-
+#[cfg_attr(feature = "profiling", tracing::instrument(level = "trace", skip_all))]
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
-
+#[cfg_attr(feature = "profiling", tracing::instrument(level = "trace", skip_all))]
 fn compression_ratio(uncompressed: u64, compressed: u64) -> f64 {
     if compressed == 0 {
         0.0
@@ -315,12 +367,43 @@ fn compression_ratio(uncompressed: u64, compressed: u64) -> f64 {
     }
 }
 
-fn main() -> ExitCode {
-    match run(Cli::parse()) {
+#[cfg_attr(feature = "profiling", tracing::instrument(level = "trace", skip_all))]
+fn exit_code(result: Result<()>) -> ExitCode {
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("gai: {error}");
             ExitCode::from(1)
         }
     }
+}
+
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    #[cfg(feature = "profiling")]
+    if let Command::Profile(profile) = cli.command {
+        let cli = Cli {
+            command: profile.command.into(),
+        };
+        if profile.sample {
+            #[cfg(unix)]
+            {
+                return match profiling::SamplingProfiler.run(|| exit_code(run(cli))) {
+                    Ok(exit_code) => exit_code,
+                    Err(error) => {
+                        eprintln!("gai: {error}");
+                        ExitCode::FAILURE
+                    }
+                };
+            }
+            #[cfg(not(unix))]
+            {
+                eprintln!("gai: sample profiling is only supported on Unix platforms");
+                return ExitCode::FAILURE;
+            }
+        }
+        return profiling::Profiler::default().run(|| exit_code(run(cli)));
+    }
+
+    exit_code(run(cli))
 }
