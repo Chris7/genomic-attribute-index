@@ -10,7 +10,9 @@ annotations.gff3.gz.gai       # Attribute index
 ```
 
 GAI can be installed from pypi via `pip install genomic-attribute-index` or for Rust users 
-via `cargo install genomic-attribute-index`.
+via `cargo install genomic-attribute-index`. Both installations will install the `gai` binary
+in addition to any library bindings. Currently there is a [Python API](#python-api) and a
+[Rust API](#rust-api).
 
 ## Design Choices
 
@@ -18,7 +20,7 @@ Compliance of GFF files is notoriously bad. Thus, we have very little validation
  * The GFF must be indexable by tabix
  * The GFF record must be parseable by noodles (our GFF parser of choice here)
 
-GFF files need to be sorted to be indexed by tabix. However, sorting a GFF is a pain. Thus,
+GFF files need to be sorted to be indexed by tabix. However, sorting a GFF is also painful. Thus,
 we have a sort function to sort entries correctly. Even better, if a GFF file does make use of
 Parent/Child tags, the parent entries will be sorted above the child entries to make the lives of
 downstream renderers and processors easier. The sort function will similarly sort bed files.
@@ -31,46 +33,36 @@ of the application.
 We have designed for speed and compressibility of the attribute index. Because a GFF can be so feature
 rich, it makes little sense to have an index whose size is similar to a compressed GFF. This influences our
 decisions around things such as attributes can be looked up exactly, by prefix, by literal
-substring, or with a regular expression.
+substring, or with a regular expression. However, features with high cardinality (unique values) will inherently
+index and compress poorer, which is shown in [Benchmarks](#benchmarks).
 
 ## Example commands
 
 ```console
-$ gai build-index annotations.gff3.gz \
+$ gai build annotations.gff3.gz \
     --attribute Name --attribute Alias --attribute gene_name
-$ gai query-index annotations.gff3.gz BRCA1
-$ gai query-index annotations.gff3.gz BRCA --match prefix
-$ gai query-index annotations.gff3.gz RCA --match contains
-$ gai query-index annotations.gff3.gz '^BRCA[0-9]+$' --match regex
+$ gai query annotations.gff3.gz BRCA1
+$ gai query annotations.gff3.gz BRCA --match prefix
+$ gai query annotations.gff3.gz RCA --match contains
+$ gai query annotations.gff3.gz '^BRCA[0-9]+$' --match regex
 $ gai inspect-index annotations.gff3.gz.gai
-$ cargo run --features profiling -- profile query-index annotations.gff3.gz BRCA1
-$ cargo run --features profiling -- profile --sample query-index annotations.gff3.gz BRCA1
+$ cargo run --features profiling -- profile query annotations.gff3.gz BRCA1
+$ cargo run --features profiling -- profile --sample query annotations.gff3.gz BRCA1
 $ gai sort annotations.gff3 > annotations.sorted.gff3
 $ gai sort annotations.bed > annotations.sorted.bed
 ```
 
-The `build`, `query`, and `inspect` commands are visible aliases for `build-index`, `query-index`, and `inspect-index`.
-
-## General arguments
+## Tabix inputs
 
 A coordinate index is discovered from an unambiguous sibling `.tbi` or `.csi`, but
-can be explicitly referenced by the `--coordinate-index` flag. Query output is lossless source
-record text on stdout, while build progress and phase timings go to stderr.
-Profiling support is opt-in and is not included in default builds. Build with
-the Cargo `profiling` feature and use `gai profile <command> ...` to print an
-aggregated tracing summary to stderr, grouped by call stack and sorted by total
-time. Each row reports call count, inclusive total duration, and average duration.
-Command results remain on stdout. Add `--sample` after `profile` to use a 100 Hz
-CPU sampler instead; it groups sampled application call stacks and reports sample
-counts, estimated time, and percentage to stderr without tracing.
-Sampling is currently supported on Unix platforms; function tracing is available
-on all supported platforms.
+can be explicitly referenced by the `--coordinate-index` flag. 
 
 ## Building an index
 
-An index is built via the `build-index` command. `--attribute` identifies which attribute values
+An index is built via the `build` command. `--attribute` identifies which attribute values
 to extract and index. It can be repeated to extract multiple attributes By default, the index is created
-as a .gai file with the same prefix as input. `--output` can be used to save to an explicit path.
+as a `.gai` file with the same prefix as input. `--output` can be used to save to an explicit path.
+Build process and timings will be reported on stderr.
 
 For GFF files, values are parsed, percent-decoded, and split into
 valid array values. Normalization trims surrounding Unicode whitespace and,
@@ -83,23 +75,35 @@ For advanced control `--memory-budget`, `--compression-threads`, and
 
 ## Querying
 
-Queries use exact normalized value matching by default. `--match prefix` matches values beginning
-with the query, and `--match contains` matches a literal substring anywhere in a value. Regex mode
-uses an unanchored Unicode-aware regular expression search; `^` and `$` can anchor a full-value
-match. Regex syntax is preserved, so escapes such as `\S` and `\D` retain their meaning. In a
-case-insensitive index, regex matching uses the regex engine's Unicode case folding, while indexed
-values continue to use GAI's ASCII-only lowercasing normalization. Query boundary whitespace is
-trimmed, and an empty query returns no results. Contains and regex queries scan the distinct indexed
-terms incrementally; exact and prefix queries retain their direct FST lookup paths. Existing indexes
-work with the new modes without rebuilding.
+Query outputs source records (bed or GFF currently) on stdout:
+
+```console
+gai query annotations.gff3.gz brca1
+gai query annotations.gff3.gz brca --match prefix
+```
+
+Queries are an exact match by default. Case sensitivity is dictated by the index building.
+The matching mode can be changed via the `--match` flag, with the following choices:
+
+* `--match prefix` matches values beginning with the query
+* `--match contains` matches a literal substring anywhere in a value.
+* `--match regex` uses a regular expression search
+* `--match contains` looks for the given value anywhere in the value
 
 ## Sorting
 
-`gai sort` infers GFF/GFF3 or BED from the input extension and writes sorted
-records to stdout. GFF comment and directive lines remain first in source order;
-feature records sort by contig, start, and end, with `ID`/`Parent` hierarchy
-putting parents before children when all three coordinates tie. BED records use
-the same contig/start/end ordering.
+This will sort GFF/BED inputs into tabix compatible outputs and write sorted results to stdout.
+
+```console
+gai sort annotations.gff3 > annotations.sorted.gff3
+```
+
+The filetpye is inferred from the input extension. The sorting logic is:
+
+* GFF comment and directive lines remain first in source order
+* feature records are sorted by contig, start, and end
+* If there is a tie at the contig, start, end level, the `ID`/`Parent` hierarchy is used as a tie
+breaker to put parents before children
 
 For vey large files, `--disk-sort` can be passed to spill to disk for sorting where
 an in-memory sort is not possible.
@@ -107,10 +111,6 @@ an in-memory sort is not possible.
 For GFF files containing sequences, sorting and parsing stops when the `##FASTA` tag
 is encountered. The records are then sorted and the sorted GFF is emited including the
 trailing fasta contents.
-
- and reports phase progress to stderr while keeping indexed
-records on stdout. Library callers can use `BuildOptions` and its optional
-progress callback without any library-level stderr output.
 
 ## Benchmarks
 
@@ -151,38 +151,6 @@ validation, and captured output.
 | gencode_v46.bed.gz | name | prefix | `ENST000006070` | 50 | 0.105s |
 | gencode_v46.bed.gz | name | regex | `^ENST00000607096\.1$` | 1 | 0.067s |
 
-## Rust API
-
-Use one-shot helpers for a single query, or keep an `IndexedSource` open for several queries:
-
-```rust
-use gai::{MatchMode, inspect_index, open_index, query_index, query_index_with_mode};
-
-fn main() -> gai::Result<()> {
-    let source = "annotations.gff3.gz";
-    let coordinate_index = "annotations.gff3.gz.tbi";
-    let index = "annotations.gff3.gz.gai";
-
-    let metadata = inspect_index(index)?;
-    let exact = query_index(source, coordinate_index, index, "BRCA1")?;
-    let prefix = query_index_with_mode(
-        source,
-        coordinate_index,
-        index,
-        "BRCA",
-        MatchMode::Prefix,
-    )?;
-
-    let mut indexed = open_index(source, coordinate_index, index)?;
-    let reusable_exact = indexed.query("BRCA1")?;
-    let reusable_prefix = indexed.query_with_mode("BRCA", MatchMode::Prefix)?;
-    // For performance counters, use the stats variant:
-    // let (records, stats) = indexed.query_with_mode_and_stats("BRCA", MatchMode::Prefix)?;
-    let _ = (metadata, exact, prefix, reusable_exact, reusable_prefix);
-    Ok(())
-}
-```
-
 ## Python API
 
 ```python
@@ -202,4 +170,39 @@ for record in indexed.query("RCA", match="contains"):
 for record in indexed.query(r"^BRCA[0-9]+$", match="regex"):
     print(record.reference_sequence_name, record.start, record.attributes)
 print(indexed.metadata().term_count, stats.records_processed)
+```
+
+
+## Rust API
+
+Use one-shot helpers for a single query, or keep an `IndexedSource` open for several queries:
+
+```rust
+use gai::{MatchMode, inspect_index, open_index, query_index, query_index_with_mode};
+
+fn main() -> gai::Result<()> {
+    let source = "annotations.gff3.gz";
+    let coordinate_index = "annotations.gff3.gz.tbi";
+    let index = "annotations.gff3.gz.gai";
+
+    let metadata = inspect_index(index)?;
+    // Defaults to an exact match
+    let exact = query_index(source, coordinate_index, index, "BRCA1")?;
+    let prefix = query_index_with_mode(
+        source,
+        coordinate_index,
+        index,
+        "BRCA",
+        MatchMode::Prefix,
+    )?;
+
+    let mut indexed = open_index(source, coordinate_index, index)?;
+    // Defaults to an exact match
+    let reusable_exact = indexed.query("BRCA1")?;
+    let reusable_prefix = indexed.query_with_mode("BRCA", MatchMode::Prefix)?;
+    // For performance counters, use the stats variant:
+    // let (records, stats) = indexed.query_with_mode_and_stats("BRCA", MatchMode::Prefix)?;
+    let _ = (metadata, exact, prefix, reusable_exact, reusable_prefix);
+    Ok(())
+}
 ```
