@@ -49,6 +49,8 @@ $ gai sort annotations.gff3 > annotations.sorted.gff3
 $ gai sort annotations.bed > annotations.sorted.bed
 ```
 
+The `build`, `query`, and `inspect` commands are visible aliases for `build-index`, `query-index`, and `inspect-index`.
+
 ## General arguments
 
 A coordinate index is discovered from an unambiguous sibling `.tbi` or `.csi`, but
@@ -149,6 +151,37 @@ validation, and captured output.
 | gencode_v46.bed.gz | name | prefix | `ENST000006070` | 50 | 0.105s |
 | gencode_v46.bed.gz | name | regex | `^ENST00000607096\.1$` | 1 | 0.067s |
 
+## Rust API
+
+Use one-shot helpers for a single query, or keep an `IndexedSource` open for several queries:
+
+```rust
+use gai::{MatchMode, inspect_index, open_index, query_index, query_index_with_mode};
+
+fn main() -> gai::Result<()> {
+    let source = "annotations.gff3.gz";
+    let coordinate_index = "annotations.gff3.gz.tbi";
+    let index = "annotations.gff3.gz.gai";
+
+    let metadata = inspect_index(index)?;
+    let exact = query_index(source, coordinate_index, index, "BRCA1")?;
+    let prefix = query_index_with_mode(
+        source,
+        coordinate_index,
+        index,
+        "BRCA",
+        MatchMode::Prefix,
+    )?;
+
+    let mut indexed = open_index(source, coordinate_index, index)?;
+    let reusable_exact = indexed.query("BRCA1")?;
+    let reusable_prefix = indexed.query_with_mode("BRCA", MatchMode::Prefix)?;
+    // For performance counters, use the stats variant:
+    // let (records, stats) = indexed.query_with_mode_and_stats("BRCA", MatchMode::Prefix)?;
+    let _ = (metadata, exact, prefix, reusable_exact, reusable_prefix);
+    Ok(())
+}
+```
 
 ## Python API
 

@@ -89,4 +89,4 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
           GH_TOKEN: ${{ github.token }}
-        run: gh workflow run release.yml --ref "v${VERSION}" -f tag="v${VERSION}" -f publish=false
+        run: gh workflow run release.yml --ref "v${VERSION}" -f tag="v${VERSION}" -f publish=true

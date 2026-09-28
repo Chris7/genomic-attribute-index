@@ -22,13 +22,13 @@ enum Command {
     #[command(name = "sort")]
     Sort(SortArgs),
     /// Build a deterministic Genomic Attribute Index (GAI) for configured GFF3 attributes.
-    #[command(name = "build-index")]
+    #[command(name = "build-index", visible_alias = "build")]
     Build(BuildIndexArgs),
     /// Query configured GFF attributes or BED names through TBI/CSI and print records.
-    #[command(name = "query-index")]
+    #[command(name = "query-index", visible_alias = "query")]
     Query(QueryIndexArgs),
     /// Display GAI format, normalization, fingerprint, and block metadata.
-    #[command(name = "inspect-index")]
+    #[command(name = "inspect-index", visible_alias = "inspect")]
     Inspect(InspectArgs),
     #[cfg(feature = "profiling")]
     /// Profile one of the GAI commands with tracing or CPU sampling.
@@ -52,13 +52,13 @@ enum ProfileCommand {
     #[command(name = "sort")]
     Sort(SortArgs),
     /// Build a deterministic Genomic Attribute Index (GAI) for configured GFF3 attributes.
-    #[command(name = "build-index")]
+    #[command(name = "build-index", visible_alias = "build")]
     Build(BuildIndexArgs),
     /// Query configured GFF attributes or BED names through TBI/CSI and print records.
-    #[command(name = "query-index")]
+    #[command(name = "query-index", visible_alias = "query")]
     Query(QueryIndexArgs),
     /// Display GAI format, normalization, fingerprint, and block metadata.
-    #[command(name = "inspect-index")]
+    #[command(name = "inspect-index", visible_alias = "inspect")]
     Inspect(InspectArgs),
 }
 

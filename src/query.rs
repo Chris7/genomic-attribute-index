@@ -1259,6 +1259,42 @@ impl IndexedSource {
             .map(|(records, _)| records)
     }
 
+    /// Queries a configured attribute value or BED name exactly.
+    ///
+    /// This is a concise alias for [`Self::query_name`]. Unknown terms return an empty vector.
+    #[cfg_attr(feature = "profiling", tracing::instrument(level = "trace", skip_all))]
+    pub fn query(&mut self, term: &str) -> Result<Vec<GffRecord>> {
+        self.query_name(term)
+    }
+
+    /// Queries exactly and returns bounded query instrumentation.
+    ///
+    /// This is a concise alias for [`Self::query_name_with_stats`].
+    #[cfg_attr(feature = "profiling", tracing::instrument(level = "trace", skip_all))]
+    pub fn query_with_stats(&mut self, term: &str) -> Result<(Vec<GffRecord>, QueryStats)> {
+        self.query_name_with_stats(term)
+    }
+
+    /// Queries a configured attribute value or BED name with an explicit match mode.
+    ///
+    /// This is a concise alias for [`Self::query_name_with_mode`].
+    #[cfg_attr(feature = "profiling", tracing::instrument(level = "trace", skip_all))]
+    pub fn query_with_mode(&mut self, term: &str, match_mode: MatchMode) -> Result<Vec<GffRecord>> {
+        self.query_name_with_mode(term, match_mode)
+    }
+
+    /// Queries with an explicit match mode and returns bounded query instrumentation.
+    ///
+    /// This is a concise alias for [`Self::query_name_with_mode_and_stats`].
+    #[cfg_attr(feature = "profiling", tracing::instrument(level = "trace", skip_all))]
+    pub fn query_with_mode_and_stats(
+        &mut self,
+        term: &str,
+        match_mode: MatchMode,
+    ) -> Result<(Vec<GffRecord>, QueryStats)> {
+        self.query_name_with_mode_and_stats(term, match_mode)
+    }
+
     /// Queries a configured attribute value or BED name using an explicit match mode and
     /// returns bounded query instrumentation.
     #[cfg_attr(feature = "profiling", tracing::instrument(level = "trace", skip_all))]

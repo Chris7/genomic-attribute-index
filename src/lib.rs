@@ -6,6 +6,36 @@
 //! Coordinates in the on-disk format are zero-based, half-open `start +
 //! length` tuples.  TBI/CSI remains responsible for locating source records;
 //! GAI stores no BGZF virtual offsets.
+//!
+//! # Rust querying API
+//!
+//! The crate exposes one-shot helpers for common queries and reusable source handles:
+//!
+//! ```no_run
+//! use gai::{MatchMode, inspect_index, open_index, query_index, query_index_with_mode};
+//!
+//! # fn main() -> gai::Result<()> {
+//! let source = "annotations.gff3.gz";
+//! let coordinate_index = "annotations.gff3.gz.tbi";
+//! let index = "annotations.gff3.gz.gai";
+//! let metadata = inspect_index(index)?;
+//! let exact = query_index(source, coordinate_index, index, "BRCA1")?;
+//! let prefix = query_index_with_mode(
+//!     source,
+//!     coordinate_index,
+//!     index,
+//!     "BRCA",
+//!     MatchMode::Prefix,
+//! )?;
+//! let mut indexed = open_index(source, coordinate_index, index)?;
+//! let reusable_exact = indexed.query("BRCA1")?;
+//! let reusable_prefix = indexed.query_with_mode("BRCA", MatchMode::Prefix)?;
+//! // For performance counters, use the stats variant:
+//! // let (records, stats) = indexed.query_with_mode_and_stats("BRCA", MatchMode::Prefix)?;
+//! # let _ = (metadata, exact, prefix, reusable_exact, reusable_prefix);
+//! # Ok(())
+//! # }
+//! ```
 
 #[cfg(test)]
 use std::collections::BTreeSet;
@@ -49,6 +79,53 @@ mod sort;
 pub use index::*;
 pub use query::{IndexedSource, NameIndexReader};
 pub use sort::{SortFormat, sort_bed, sort_file, sort_gff};
+
+/// Opens a GFF3 or BED source with its coordinate index and GAI.
+///
+/// The source, coordinate index, and GAI fingerprints are checked before the handle is returned.
+#[cfg_attr(feature = "profiling", tracing::instrument(level = "trace", skip_all))]
+pub fn open_index(
+    source_path: impl AsRef<Path>,
+    coordinate_index_path: impl AsRef<Path>,
+    gai_path: impl AsRef<Path>,
+) -> Result<IndexedSource> {
+    IndexedSource::open(source_path, coordinate_index_path, gai_path)
+}
+
+/// Opens an indexed source, performs an exact query, and returns matching records.
+///
+/// For multiple queries against the same files, use [`open_index`] and reuse its handle.
+#[cfg_attr(feature = "profiling", tracing::instrument(level = "trace", skip_all))]
+pub fn query_index(
+    source_path: impl AsRef<Path>,
+    coordinate_index_path: impl AsRef<Path>,
+    gai_path: impl AsRef<Path>,
+    term: &str,
+) -> Result<Vec<GffRecord>> {
+    let mut indexed = open_index(source_path, coordinate_index_path, gai_path)?;
+    indexed.query(term)
+}
+
+/// Opens an indexed source and queries with the selected matching mode.
+///
+/// For multiple queries against the same files, use [`open_index`] and reuse its handle.
+#[cfg_attr(feature = "profiling", tracing::instrument(level = "trace", skip_all))]
+pub fn query_index_with_mode(
+    source_path: impl AsRef<Path>,
+    coordinate_index_path: impl AsRef<Path>,
+    gai_path: impl AsRef<Path>,
+    term: &str,
+    match_mode: MatchMode,
+) -> Result<Vec<GffRecord>> {
+    let mut indexed = open_index(source_path, coordinate_index_path, gai_path)?;
+    indexed.query_with_mode(term, match_mode)
+}
+
+/// Reads and validates metadata from a GAI index.
+#[cfg_attr(feature = "profiling", tracing::instrument(level = "trace", skip_all))]
+pub fn inspect_index(gai_path: impl AsRef<Path>) -> Result<IndexMetadata> {
+    NameIndexReader::open(gai_path).map(|reader| reader.inspect())
+}
 
 const MAGIC: [u8; 4] = *b"GAI\x01";
 const MAJOR_VERSION: u16 = 1;

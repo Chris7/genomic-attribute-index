@@ -1,5 +1,9 @@
 use std::{fs::File, io::Write, path::Path, process::Command};
 
+use gai::{
+    MatchMode, NameIndexOptions, build_name_index, inspect_index, open_index, query_index,
+    query_index_with_mode,
+};
 use noodles::{
     bgzf, core::Position, csi::binning_index::index::reference_sequence::bin::Chunk, tabix,
 };
@@ -57,6 +61,8 @@ fn cli_index_query_and_inspect() {
     let source = source.to_string_lossy().into_owned();
     let coordinate_index = coordinate_index.to_string_lossy().into_owned();
     let destination_string = destination.to_string_lossy().into_owned();
+    let alias_destination = directory.path().join("cli-alias.gai");
+    let alias_destination_string = alias_destination.to_string_lossy().into_owned();
 
     let indexed = Command::new(binary)
         .args([
@@ -78,6 +84,26 @@ fn cli_index_query_and_inspect() {
     assert!(indexing_stderr.contains("Scan"));
     assert!(indexing_stderr.contains("Complete"));
 
+    let alias_built = Command::new(binary)
+        .args([
+            "build",
+            &source,
+            "--attribute",
+            "Name",
+            "--coordinate-index",
+            &coordinate_index,
+            "--output",
+            &alias_destination_string,
+        ])
+        .output()
+        .expect("should run gai build alias");
+    assert!(
+        alias_built.status.success(),
+        "stderr: {:?}",
+        alias_built.stderr
+    );
+    assert!(alias_destination.exists());
+
     let queried = Command::new(binary)
         .args([
             "query-index",
@@ -95,6 +121,25 @@ fn cli_index_query_and_inspect() {
         String::from_utf8_lossy(&queried.stdout).trim(),
         "chr1\tsrc\tgene\t10\t20\t.\t+\t.\tName=BRCA1;Alias=BRCC1"
     );
+
+    let alias_queried = Command::new(binary)
+        .args([
+            "query",
+            &source,
+            "BRCA1",
+            "--coordinate-index",
+            &coordinate_index,
+            "--gai",
+            &alias_destination_string,
+        ])
+        .output()
+        .expect("should run gai query alias");
+    assert!(
+        alias_queried.status.success(),
+        "stderr: {:?}",
+        alias_queried.stderr
+    );
+    assert_eq!(alias_queried.stdout, queried.stdout);
 
     let prefix = Command::new(binary)
         .args([
@@ -229,6 +274,17 @@ fn cli_index_query_and_inspect() {
     assert!(inspection.contains("lengths compression"));
     assert!(!String::from_utf8_lossy(&inspected.stderr).contains("time.busy"));
 
+    let alias_inspected = Command::new(binary)
+        .args(["inspect", &alias_destination_string])
+        .output()
+        .expect("should run gai inspect alias");
+    assert!(
+        alias_inspected.status.success(),
+        "stderr: {:?}",
+        alias_inspected.stderr
+    );
+    assert_eq!(alias_inspected.stdout, inspected.stdout);
+
     if cfg!(feature = "profiling") {
         let profiled = Command::new(binary)
             .args(["profile", "inspect-index", &destination_string])
@@ -236,6 +292,25 @@ fn cli_index_query_and_inspect() {
             .expect("should run profiled inspect-index");
         assert!(profiled.status.success(), "stderr: {:?}", profiled.stderr);
         assert_eq!(profiled.stdout, inspected.stdout);
+        let profiled_alias = Command::new(binary)
+            .args([
+                "profile",
+                "query",
+                &source,
+                "BRCA1",
+                "--coordinate-index",
+                &coordinate_index,
+                "--gai",
+                &alias_destination_string,
+            ])
+            .output()
+            .expect("should run profiled query alias");
+        assert!(
+            profiled_alias.status.success(),
+            "stderr: {:?}",
+            profiled_alias.stderr
+        );
+        assert_eq!(profiled_alias.stdout, queried.stdout);
         let profiling_stderr = String::from_utf8_lossy(&profiled.stderr);
         assert!(profiling_stderr.contains("Profile results"));
         assert!(profiling_stderr.contains("Total (ms)"));
@@ -285,6 +360,9 @@ fn cli_index_query_and_inspect() {
     assert!(help.contains("build-index"));
     assert!(help.contains("query-index"));
     assert!(help.contains("inspect-index"));
+    assert!(help.contains("[alias: build]"));
+    assert!(help.contains("[alias: query]"));
+    assert!(help.contains("[alias: inspect]"));
     assert_eq!(
         help.contains("profile"),
         cfg!(feature = "profiling"),
@@ -297,6 +375,86 @@ fn cli_index_query_and_inspect() {
         .output()
         .expect("should run removed command check");
     assert!(!old_surface.status.success());
+}
+
+#[test]
+fn rust_querying_api_gff_helpers_and_reusable_source() {
+    let directory = tempdir().expect("should create temp directory");
+    let (source, coordinate_index) = write_fixture(directory.path());
+    let destination = directory.path().join("api.gai");
+    let options = NameIndexOptions::new(["Name"], false).expect("should configure Name");
+    build_name_index(&source, &coordinate_index, &destination, &options)
+        .expect("should build GAI fixture");
+
+    let metadata = inspect_index(&destination).expect("should inspect GAI");
+    assert_eq!(metadata.attributes, vec!["Name".to_string()]);
+    assert_eq!(metadata.term_count, 2);
+
+    let exact = query_index(&source, &coordinate_index, &destination, "BRCA1")
+        .expect("one-shot exact query should work");
+    assert_eq!(exact.len(), 1);
+    assert_eq!(
+        exact[0].raw_line,
+        "chr1\tsrc\tgene\t10\t20\t.\t+\t.\tName=BRCA1;Alias=BRCC1"
+    );
+
+    let prefix = query_index_with_mode(
+        &source,
+        &coordinate_index,
+        &destination,
+        "BRCA",
+        MatchMode::Prefix,
+    )
+    .expect("one-shot prefix query should work");
+    assert_eq!(prefix, exact);
+
+    let mut indexed =
+        open_index(&source, &coordinate_index, &destination).expect("should open indexed source");
+    assert_eq!(indexed.metadata().term_count, metadata.term_count);
+    assert_eq!(
+        indexed.query("BRCA1").expect("exact query should work"),
+        exact
+    );
+    assert_eq!(
+        indexed
+            .query_with_mode("RCA", MatchMode::Contains)
+            .expect("contains query should work"),
+        exact
+    );
+
+    let (exact_with_stats, exact_stats) = indexed
+        .query_with_stats("BRCA1")
+        .expect("exact query stats should work");
+    assert_eq!(exact_with_stats, exact);
+    assert_eq!(exact_stats.matching_records, 1);
+    let (prefix_with_stats, prefix_stats) = indexed
+        .query_with_mode_and_stats("BRCA", MatchMode::Prefix)
+        .expect("prefix query stats should work");
+    assert_eq!(prefix_with_stats, exact);
+    assert_eq!(prefix_stats.matching_records, 1);
+
+    assert!(
+        indexed
+            .query("missing")
+            .expect("unknown terms are empty")
+            .is_empty()
+    );
+    assert!(matches!(
+        indexed.query_with_mode("missing[", MatchMode::Regex),
+        Err(gai::Error::InvalidInput(_))
+    ));
+
+    let stale_source = directory.path().join("stale.gff3.gz");
+    std::fs::copy(&source, &stale_source).expect("should copy source fixture");
+    std::fs::write(&stale_source, b"changed source").expect("should stale source fixture");
+    assert!(matches!(
+        open_index(&stale_source, &coordinate_index, &destination),
+        Err(gai::Error::Stale(message)) if message.contains("source fingerprint")
+    ));
+    assert!(matches!(
+        inspect_index(directory.path().join("missing.gai")),
+        Err(gai::Error::Io(_))
+    ));
 }
 
 #[test]
@@ -325,6 +483,17 @@ fn cli_bed_index_query_supports_all_match_modes() {
         .output()
         .expect("should build BED name index");
     assert!(indexed.status.success(), "stderr: {:?}", indexed.stderr);
+
+    let exact_api = gai::query_index(&source, &coordinate_index, &destination, "thrL")
+        .expect("one-shot BED exact query should work");
+    assert_eq!(exact_api.len(), 1);
+    let mut indexed_api = gai::open_index(&source, &coordinate_index, &destination)
+        .expect("should open BED indexed source");
+    let (prefix_api, prefix_stats) = indexed_api
+        .query_with_mode_and_stats("thr", MatchMode::Prefix)
+        .expect("reusable BED prefix query should work");
+    assert!(prefix_api.len() >= 4);
+    assert_eq!(prefix_stats.matching_records as usize, prefix_api.len());
 
     let query = |term: &str, mode: Option<&str>| {
         let mut command = Command::new(binary);
