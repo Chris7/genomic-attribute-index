@@ -10,7 +10,7 @@ use std::{
 
 use ext_sort::{ExternalSorter, ExternalSorterBuilder, LimitedBufferBuilder};
 use flate2::bufread::MultiGzDecoder;
-use noodles::gff;
+use noodles::gff::{self, record::attributes::field::Value as GffAttributeValue};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{Error, Result};
@@ -182,13 +182,14 @@ pub fn sort_gff<R: BufRead, W: Write>(mut reader: R, disk_sort: bool, mut writer
     let mut fasta_line = None;
     let mut line_number = 0;
 
+    let mut line = Vec::new();
     let records = std::iter::from_fn(|| {
         if fasta_line.is_some() {
             return None;
         }
 
         loop {
-            let mut line = Vec::new();
+            line.clear();
 
             match reader.read_until(b'\n', &mut line) {
                 Ok(0) => return None,
@@ -197,21 +198,12 @@ pub fn sort_gff<R: BufRead, W: Write>(mut reader: R, disk_sort: bool, mut writer
             }
 
             line_number += 1;
-
-            // Work with the line minus its newline for parsing/comparison.
-            let mut raw = line.as_slice();
-
-            if let Some(stripped) = raw.strip_suffix(b"\n") {
-                raw = stripped;
-            }
-            if let Some(stripped) = raw.strip_suffix(b"\r") {
-                raw = stripped;
-            }
+            let raw = strip_line_ending(&line);
 
             // This must be checked before the generic comment handling.
             if raw == b"##FASTA" {
                 // Keep the original bytes, including its line ending.
-                fasta_line = Some(line);
+                fasta_line = Some(std::mem::take(&mut line));
                 return None;
             }
 
@@ -220,6 +212,8 @@ pub fn sort_gff<R: BufRead, W: Write>(mut reader: R, disk_sort: bool, mut writer
                 continue;
             }
 
+            // The sort record retains this input buffer instead of copying its bytes.
+            let raw = std::mem::take(&mut line);
             return Some(parse_gff_record(raw, line_number).map_err(io::Error::other));
         }
     });
@@ -289,25 +283,148 @@ pub fn sort_bed<R: BufRead, W: Write>(reader: R, disk_sort: bool, mut writer: W)
 
 #[derive(Debug, Serialize, Deserialize)]
 struct GffSortRecord {
+    #[serde(with = "raw_bytes")]
     raw: Vec<u8>,
     contig: String,
     start: u64,
     end: u64,
+    #[serde(with = "raw_byte_lists")]
     ids: Vec<Vec<u8>>,
+    #[serde(with = "raw_byte_lists")]
     parents: Vec<Vec<u8>>,
     source_index: usize,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct BedSortRecord {
+    #[serde(with = "raw_bytes")]
     raw: Vec<u8>,
     contig: String,
     start: u64,
     end: u64,
     source_index: usize,
 }
+
+// Encode each raw row as bulk bytes instead of serializing every byte as an element in ext-sort chunks.
+mod raw_bytes {
+    use serde::{
+        Deserializer, Serializer,
+        de::{Error as DeError, Visitor},
+    };
+
+    pub(super) fn serialize<S>(raw: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_bytes(raw)
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct RawBytesVisitor;
+
+        impl<'de> Visitor<'de> for RawBytesVisitor {
+            type Value = Vec<u8>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a MessagePack binary value")
+            }
+
+            fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E>
+            where
+                E: DeError,
+            {
+                Ok(value.to_vec())
+            }
+
+            fn visit_byte_buf<E>(self, value: Vec<u8>) -> Result<Self::Value, E>
+            where
+                E: DeError,
+            {
+                Ok(value)
+            }
+        }
+
+        deserializer.deserialize_bytes(RawBytesVisitor)
+    }
+}
+
+mod raw_byte_lists {
+    use std::fmt;
+
+    use serde::{
+        Deserialize, Deserializer, Serialize, Serializer,
+        de::{SeqAccess, Visitor},
+        ser::SerializeSeq,
+    };
+
+    pub(super) fn serialize<S>(values: &[Vec<u8>], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(values.len()))?;
+        for value in values {
+            sequence.serialize_element(&RawBytesRef(value))?;
+        }
+        sequence.end()
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Vec<Vec<u8>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct RawByteListsVisitor;
+
+        impl<'de> Visitor<'de> for RawByteListsVisitor {
+            type Value = Vec<Vec<u8>>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a sequence of MessagePack binary values")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or(0));
+                while let Some(value) = sequence.next_element::<RawBytes>()? {
+                    values.push(value.0);
+                }
+                Ok(values)
+            }
+        }
+
+        deserializer.deserialize_seq(RawByteListsVisitor)
+    }
+
+    struct RawBytesRef<'a>(&'a [u8]);
+
+    impl Serialize for RawBytesRef<'_> {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            super::raw_bytes::serialize(self.0, serializer)
+        }
+    }
+
+    struct RawBytes(Vec<u8>);
+
+    impl<'de> Deserialize<'de> for RawBytes {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            super::raw_bytes::deserialize(deserializer).map(Self)
+        }
+    }
+}
+
 #[cfg_attr(feature = "profiling", tracing::instrument(level = "trace", skip_all))]
-fn parse_gff_record(raw: &[u8], line_number: usize) -> Result<GffSortRecord> {
+fn parse_gff_record(mut raw: Vec<u8>, line_number: usize) -> Result<GffSortRecord> {
+    raw.truncate(strip_line_ending(&raw).len());
     if raw.is_empty() || raw.iter().all(u8::is_ascii_whitespace) {
         return Err(invalid_line(
             "GFF",
@@ -316,7 +433,7 @@ fn parse_gff_record(raw: &[u8], line_number: usize) -> Result<GffSortRecord> {
         ));
     }
 
-    let mut parser = gff::io::Reader::new(Cursor::new(raw));
+    let mut parser = gff::io::Reader::new(Cursor::new(raw.as_slice()));
     let mut line = gff::Line::default();
     parser.read_line(&mut line).map_err(|error| {
         invalid_line(
@@ -360,30 +477,64 @@ fn parse_gff_record(raw: &[u8], line_number: usize) -> Result<GffSortRecord> {
         ));
     }
 
-    let record_buf = gff::feature::RecordBuf::try_from_feature_record(&record)
+    record
+        .score()
+        .transpose()
         .map_err(|error| invalid_line("GFF", line_number, format!("invalid record: {error}")))?;
+    record
+        .strand()
+        .map_err(|error| invalid_line("GFF", line_number, format!("invalid record: {error}")))?;
+    record
+        .phase()
+        .transpose()
+        .map_err(|error| invalid_line("GFF", line_number, format!("invalid record: {error}")))?;
+
     let mut ids = Vec::new();
     let mut parents = Vec::new();
-    for (tag, value) in record_buf.attributes().as_ref() {
-        let tag = <_ as AsRef<[u8]>>::as_ref(tag);
-        if tag != b"ID" && tag != b"Parent" {
-            continue;
+    for result in record.attributes().iter() {
+        let (tag, value) = result.map_err(|error| {
+            invalid_line("GFF", line_number, format!("invalid record: {error}"))
+        })?;
+        let tag = <_ as AsRef<[u8]>>::as_ref(tag.as_ref());
+        let is_id = tag == b"ID";
+        let is_parent = tag == b"Parent";
+
+        // RecordBuf's IndexMap keeps the last value for each percent-decoded tag.
+        if is_id {
+            ids.clear();
+        } else if is_parent {
+            parents.clear();
         }
-        for value in value.iter() {
-            let value = <_ as AsRef<[u8]>>::as_ref(value);
-            if value.is_empty() {
-                continue;
+
+        match value {
+            GffAttributeValue::String(value) => {
+                let value = <_ as AsRef<[u8]>>::as_ref(value.as_ref());
+                if !value.is_empty() {
+                    if is_id {
+                        ids.push(value.to_vec());
+                    } else if is_parent {
+                        parents.push(value.to_vec());
+                    }
+                }
             }
-            if tag == b"ID" {
-                ids.push(value.to_vec());
-            } else {
-                parents.push(value.to_vec());
+            GffAttributeValue::Array(values) => {
+                for value in values.iter() {
+                    let value = <_ as AsRef<[u8]>>::as_ref(value.as_ref());
+                    if value.is_empty() {
+                        continue;
+                    }
+                    if is_id {
+                        ids.push(value.to_vec());
+                    } else if is_parent {
+                        parents.push(value.to_vec());
+                    }
+                }
             }
         }
     }
 
     Ok(GffSortRecord {
-        raw: raw.to_vec(),
+        raw,
         contig,
         start,
         end,
@@ -471,6 +622,21 @@ fn compare_bed_records(left: &BedSortRecord, right: &BedSortRecord) -> Ordering 
 }
 #[cfg_attr(feature = "profiling", tracing::instrument(level = "trace", skip_all))]
 fn order_gff_tie_group(records: &[GffSortRecord]) -> Result<Vec<usize>> {
+    if records.len() == 1 {
+        let record = &records[0];
+        if record
+            .ids
+            .iter()
+            .any(|id| record.parents.iter().any(|parent| parent == id))
+        {
+            return Err(Error::InvalidInput(format!(
+                "GFF parent hierarchy contains a cycle among records on contig {:?} at {}..{}",
+                record.contig, record.start, record.end
+            )));
+        }
+        return Ok(vec![0]);
+    }
+
     let mut id_to_records: HashMap<&[u8], Vec<usize>> = HashMap::new();
     for (index, record) in records.iter().enumerate() {
         for id in &record.ids {
@@ -533,4 +699,228 @@ fn write_line(writer: &mut impl Write, line: &[u8]) -> io::Result<()> {
 #[cfg_attr(feature = "profiling", tracing::instrument(level = "trace", skip_all))]
 fn invalid_line(format: &str, line_number: usize, message: impl Into<String>) -> Error {
     Error::InvalidInput(format!("{format} line {line_number}: {}", message.into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Cursor, Error as IoError};
+
+    use noodles::gff;
+
+    use super::{parse_gff_record, sort_bed, sort_gff};
+
+    type Relationships = (Vec<Vec<u8>>, Vec<Vec<u8>>);
+
+    #[test]
+    fn test_disk_sort_gff_spills_preserve_parent_order_and_raw_lines() {
+        let mut input = String::from("##gff-version 3\n#source-order-comment\n");
+        input.push_str("chr1\ts\tmRNA\t10\t20\t.\t+\t.\tID=child-escaped;Parent=pr%C3%A9%2Cfix\n");
+        input.push_str("chr1\ts\tmRNA\t10\t20\t.\t+\t.\tID=child-direct;Parent=direct-λ\n");
+        for index in 0..20 {
+            input.push_str(&format!(
+                "chr1\ts\tgene\t10\t20\t.\t+\t.\tID=independent-{index:02}\n"
+            ));
+        }
+        input.push_str("chr1\ts\tgene\t10\t20\t.\t+\t.\tID=pr%C3%A9%2Cfix\n");
+        input.push_str("chr1\ts\tgene\t10\t20\t.\t+\t.\tID=direct-λ\n");
+        input.push_str("##FASTA\n>sequence\nACGT\n");
+
+        let mut in_memory = Vec::new();
+        sort_gff(Cursor::new(input.as_bytes()), false, &mut in_memory)
+            .expect("in-memory GFF sort should succeed");
+        let mut spilled = Vec::new();
+        sort_gff(Cursor::new(input.as_bytes()), true, &mut spilled)
+            .expect("multi-chunk GFF sort should succeed");
+        assert_eq!(
+            spilled, in_memory,
+            "Spilled GFF output should match memory output"
+        );
+
+        let output = String::from_utf8(spilled).expect("GFF output should remain UTF-8");
+        assert!(
+            output.starts_with("##gff-version 3\n#source-order-comment\n"),
+            "GFF comments should remain before sorted records"
+        );
+        assert!(
+            output.ends_with("##FASTA\n>sequence\nACGT\n"),
+            "the FASTA section should remain byte-for-byte intact"
+        );
+
+        let record_lines = output.lines().collect::<Vec<_>>();
+        let line_position = |needle: &str| {
+            record_lines
+                .iter()
+                .position(|line| line.contains(needle))
+                .expect("expected feature should be present")
+        };
+        assert!(
+            line_position("ID=pr%C3%A9%2Cfix") < line_position("ID=child-escaped"),
+            "percent-decoded UTF-8 parent should precede its child across spills"
+        );
+        assert!(
+            line_position("ID=direct-λ") < line_position("ID=child-direct"),
+            "literal UTF-8 parent should precede its child across spills"
+        );
+        let stable_positions = (0..20)
+            .map(|index| line_position(&format!("ID=independent-{index:02}")))
+            .collect::<Vec<_>>();
+        assert!(
+            stable_positions.windows(2).all(|pair| pair[0] < pair[1]),
+            "unrelated GFF ties should retain source order"
+        );
+    }
+
+    #[test]
+    fn test_disk_sort_gff_spills_reject_parent_cycles() {
+        let self_parent = b"chr1\ts\tgene\t1\t2\t.\t+\t.\tID=self;Parent=self\n";
+        let self_error = sort_gff(Cursor::new(self_parent), true, Vec::new())
+            .expect_err("a self-parent record should be rejected");
+        assert!(
+            self_error
+                .to_string()
+                .contains("parent hierarchy contains a cycle"),
+            "self-parent error should identify the hierarchy cycle"
+        );
+
+        let cross_parent = concat!(
+            "chr1\ts\tgene\t1\t2\t.\t+\t.\tID=a;Parent=b\n",
+            "chr1\ts\tgene\t1\t2\t.\t+\t.\tID=b;Parent=a\n",
+        );
+        let cross_error = sort_gff(Cursor::new(cross_parent.as_bytes()), true, Vec::new())
+            .expect_err("a cross-parent cycle should be rejected");
+        assert!(
+            cross_error
+                .to_string()
+                .contains("parent hierarchy contains a cycle"),
+            "cross-parent error should identify the hierarchy cycle"
+        );
+    }
+
+    #[test]
+    fn test_disk_sort_bed_spills_preserve_stable_ties_and_raw_lines() {
+        let mut input = String::from("chr2\t0\t5\tother-contig\textra\n");
+        for index in 0..20 {
+            input.push_str(&format!("chr1\t10\t20\ttie-{index:02}\textra-{index:02}\n"));
+        }
+        input.push_str("chr1\t1\t30\tearly\tunaltered-extra-column\n");
+
+        let mut in_memory = Vec::new();
+        sort_bed(Cursor::new(input.as_bytes()), false, &mut in_memory)
+            .expect("in-memory BED sort should succeed");
+        let mut spilled = Vec::new();
+        sort_bed(Cursor::new(input.as_bytes()), true, &mut spilled)
+            .expect("multi-chunk BED sort should succeed");
+        assert_eq!(
+            spilled, in_memory,
+            "Spilled BED output should match memory output"
+        );
+
+        let output = String::from_utf8(spilled).expect("BED output should remain UTF-8");
+        let records = output.lines().collect::<Vec<_>>();
+        assert_eq!(
+            records.first(),
+            Some(&"chr1\t1\t30\tearly\tunaltered-extra-column")
+        );
+        assert_eq!(records.last(), Some(&"chr2\t0\t5\tother-contig\textra"));
+        let stable_positions = (0..20)
+            .map(|index| {
+                records
+                    .iter()
+                    .position(|line| line.contains(&format!("\ttie-{index:02}\t")))
+                    .expect("expected BED record should be present")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            stable_positions.windows(2).all(|pair| pair[0] < pair[1]),
+            "equal-coordinate BED records should retain source order"
+        );
+    }
+    #[test]
+    fn test_gff_sort_record_relationships_match_record_buf_duplicates() {
+        let raw = b"chr1\ts\tgene\t1\t2\t.\t+\t.\tID=first;I%44=last;Parent=old;Par%65nt=new%2Ctag,second;other=a,b\n";
+        let expected = record_buf_relationships(raw)
+            .expect("RecordBuf should decode duplicate and array-valued attributes");
+        let actual = parse_gff_record(raw.to_vec(), 1)
+            .expect("the streaming parser should accept the same record");
+
+        assert_eq!(actual.ids, expected.0);
+        assert_eq!(actual.parents, expected.1);
+        assert_eq!(
+            expected,
+            (
+                vec![b"last".to_vec()],
+                vec![b"new,tag".to_vec(), b"second".to_vec()],
+            ),
+            "last duplicate decoded tags should replace prior values"
+        );
+    }
+
+    #[test]
+    fn test_gff_sort_record_validation_matches_record_buf_for_unused_fields() {
+        let invalid_records = [
+            (
+                "malformed unused attribute",
+                gff_record_line(".", "+", ".", "ID=gene;unused"),
+            ),
+            (
+                "invalid unused score",
+                gff_record_line("not-a-score", "+", ".", "ID=gene"),
+            ),
+            (
+                "invalid unused strand",
+                gff_record_line(".", "x", ".", "ID=gene"),
+            ),
+            (
+                "invalid unused phase",
+                gff_record_line(".", "+", "3", "ID=gene"),
+            ),
+        ];
+
+        for (description, raw) in invalid_records {
+            assert!(
+                record_buf_relationships(&raw).is_err(),
+                "RecordBuf should reject {description}"
+            );
+            assert!(
+                parse_gff_record(raw, 1).is_err(),
+                "the streaming parser should reject {description}"
+            );
+        }
+    }
+
+    fn gff_record_line(score: &str, strand: &str, phase: &str, attributes: &str) -> Vec<u8> {
+        format!("chr1\ts\tgene\t1\t2\t{score}\t{strand}\t{phase}\t{attributes}").into_bytes()
+    }
+
+    fn record_buf_relationships(raw: &[u8]) -> std::io::Result<Relationships> {
+        let mut reader = gff::io::Reader::new(Cursor::new(raw));
+        let mut line = gff::Line::default();
+        reader.read_line(&mut line)?;
+        let record = line
+            .as_record()
+            .ok_or_else(|| IoError::other("expected a feature record"))??;
+        let record_buf = gff::feature::RecordBuf::try_from_feature_record(&record)?;
+        let mut ids = Vec::new();
+        let mut parents = Vec::new();
+
+        for (tag, value) in record_buf.attributes().as_ref() {
+            let tag = <_ as AsRef<[u8]>>::as_ref(tag);
+            if tag != b"ID" && tag != b"Parent" {
+                continue;
+            }
+            for value in value.iter() {
+                let value = <_ as AsRef<[u8]>>::as_ref(value);
+                if value.is_empty() {
+                    continue;
+                }
+                if tag == b"ID" {
+                    ids.push(value.to_vec());
+                } else {
+                    parents.push(value.to_vec());
+                }
+            }
+        }
+
+        Ok((ids, parents))
+    }
 }
