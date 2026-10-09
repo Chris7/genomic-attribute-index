@@ -20,6 +20,7 @@ from ._gai import (
     QueryStats,
     __version__ as _extension_version,
     build_index as _build_index,
+    compress as _compress,
     inspect_index as _inspect_index,
     open_index as _open_index,
     query_index as _query_index,
@@ -39,6 +40,7 @@ __all__ = [
     "MatchMode",
     "QueryStats",
     "build_index",
+    "compress",
     "inspect_index",
     "open_index",
     "query_index",
@@ -56,12 +58,22 @@ except PackageNotFoundError:
 
 
 def sort(input, output, *, disk_sort=False) -> None:
-    """Sort a GFF/GFF3 or BED file into ``output``.
+    """Sort a GFF/GFF3/GTF or BED file into ``output``.
 
     The input format is inferred from its extension. Set ``disk_sort=True``
     for files that may not fit in memory.
     """
     return _sort(input, output, disk_sort=disk_sort)
+
+
+def compress(input, output, *, coordinate_index=None) -> None:
+    """Compress an already coordinate-sorted GFF/GFF3/GTF or BED file to BGZF.
+
+    A CSI coordinate index is built while compressing. By default it is written
+    to ``<output>.csi``; pass ``coordinate_index`` to choose another path.
+    The input format is inferred from its extension.
+    """
+    return _compress(input, output, coordinate_index=coordinate_index)
 
 
 def build_index(

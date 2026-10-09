@@ -1,13 +1,29 @@
 use std::{
     fs,
-    io::{Cursor, Read},
-    path::Path,
+    io::{BufReader, Cursor, Read},
+    path::{Path, PathBuf},
     process::Command,
 };
 
 use flate2::read::MultiGzDecoder;
-use gai::{sort_bed, sort_file, sort_gff};
+use gai::{
+    BuildOptions, NameIndexOptions, SortFormat, build_name_index_with_options, query_index,
+    sort_bed, sort_bgzf_with_csi, sort_file, sort_gff,
+};
+use noodles::{
+    bgzf,
+    core::Region,
+    csi::{self, BinningIndex},
+};
 use tempfile::tempdir;
+
+struct ReadOnlyReader(Cursor<Vec<u8>>);
+
+impl Read for ReadOnlyReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(buffer)
+    }
+}
 
 fn lines(output: Vec<u8>) -> Vec<String> {
     String::from_utf8(output)
@@ -15,6 +31,46 @@ fn lines(output: Vec<u8>) -> Vec<String> {
         .lines()
         .map(str::to_owned)
         .collect()
+}
+
+fn decode_bgzf(input: &[u8]) -> Vec<u8> {
+    let mut reader = bgzf::io::Reader::new(Cursor::new(input));
+    let mut output = Vec::new();
+    reader
+        .read_to_end(&mut output)
+        .expect("BGZF output should decode");
+    output
+}
+
+fn query_csi(source: &[u8], index_bytes: &[u8], region: &str) -> Vec<u8> {
+    let index = csi::io::Reader::new(Cursor::new(index_bytes))
+        .read_index()
+        .expect("should read CSI index");
+    let region = region.parse::<Region>().expect("should parse query region");
+    let mut reader = csi::io::IndexedReader::new(Cursor::new(source), index);
+    reader
+        .query(&region)
+        .expect("should query CSI")
+        .map(|result| {
+            result
+                .expect("should read indexed annotation")
+                .as_ref()
+                .as_bytes()
+                .to_vec()
+        })
+        .collect::<Vec<_>>()
+        .concat()
+}
+
+fn serialize_csi(index: &csi::Index) -> Vec<u8> {
+    let mut output = Vec::new();
+    let mut writer = csi::io::Writer::new(&mut output);
+    writer.write_index(index).expect("should write CSI index");
+    writer
+        .into_inner()
+        .finish()
+        .expect("should finish CSI index");
+    output
 }
 
 #[test]
@@ -79,6 +135,68 @@ fn gff_parent_hierarchy_does_not_override_coordinate_order() {
             "chr1\ts\texon\t10\t20\t.\t+\t.\tID=child;Parent=gene",
             "chr1\ts\tgene\t30\t40\t.\t+\t.\tID=gene",
         ]
+    );
+}
+
+#[test]
+fn rust_sort_bgzf_with_csi_accepts_non_seekable_streams() {
+    let long_value = "x".repeat(70 * 1024);
+    let gff = format!(
+        "chr2\ts\tgene\t600000000\t600000010\t.\t+\t.\tName=second-contig\n\
+         chr1\ts\tgene\t1\t2\t.\t+\t.\tName=cross-block;Note={long_value}\n\
+         chr1\ts\tgene\t600000000\t600000010\t.\t+\t.\tName=after-block\n"
+    );
+    let mut compressed_gff = Vec::new();
+    let mut gff_writer = bgzf::io::Writer::new(&mut compressed_gff);
+    let gff_index = sort_bgzf_with_csi(
+        BufReader::new(ReadOnlyReader(Cursor::new(gff.as_bytes().to_vec()))),
+        &mut gff_writer,
+        SortFormat::Gff,
+        true,
+    )
+    .expect("should sort and index a non-seekable GFF reader");
+    gff_writer
+        .finish()
+        .expect("should finish compressed GFF output");
+    let gff_index = serialize_csi(&gff_index);
+    assert!(
+        String::from_utf8_lossy(&query_csi(&compressed_gff, &gff_index, "chr1:1-2"))
+            .contains("Name=cross-block")
+    );
+    assert!(
+        String::from_utf8_lossy(&query_csi(
+            &compressed_gff,
+            &gff_index,
+            "chr1:600000000-600000010"
+        ))
+        .contains("Name=after-block")
+    );
+
+    let bed = b"chr2\t600000000\t600000010\tsecond-contig\nchr1\t0\t5\tfirst\n";
+    let mut compressed_bed = Vec::new();
+    let mut bed_writer = bgzf::io::Writer::new(&mut compressed_bed);
+    let bed_index = sort_bgzf_with_csi(
+        BufReader::new(ReadOnlyReader(Cursor::new(bed.to_vec()))),
+        &mut bed_writer,
+        SortFormat::Bed,
+        true,
+    )
+    .expect("should sort and index a non-seekable BED reader");
+    bed_writer
+        .finish()
+        .expect("should finish compressed BED output");
+    let bed_index = serialize_csi(&bed_index);
+    assert!(
+        String::from_utf8_lossy(&query_csi(&compressed_bed, &bed_index, "chr1:1-5"))
+            .contains("first")
+    );
+    assert!(
+        String::from_utf8_lossy(&query_csi(
+            &compressed_bed,
+            &bed_index,
+            "chr2:600000001-600000010"
+        ))
+        .contains("second-contig")
     );
 }
 
@@ -272,7 +390,12 @@ fn cli_sort_help_stdout_and_extension_errors() {
         .output()
         .expect("should show sort help");
     assert!(help.status.success());
-    assert!(String::from_utf8_lossy(&help.stdout).contains("Input .gff, .gff3, or .bed"));
+    let help = String::from_utf8_lossy(&help.stdout);
+    assert!(help.contains("Input .gff, .gff3, .gtf, or .bed"));
+    assert!(help.contains("--compress"));
+    assert!(help.contains("--output"));
+    assert!(help.contains("--coordinate-index"));
+    assert!(help.contains("Write sorted output as BGZF"));
 
     let unsupported = directory.path().join("input.txt");
     fs::write(&unsupported, b"not an annotation\n").expect("should write unsupported input");
@@ -282,4 +405,333 @@ fn cli_sort_help_stdout_and_extension_errors() {
         .expect("should reject unsupported extension");
     assert!(!rejected.status.success());
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("unsupported sort input extension"));
+}
+
+#[test]
+fn cli_sort_compresses_gff_gtf_and_bed_output_as_bgzf() {
+    let directory = tempdir().expect("should create temporary directory");
+    let fasta_sequence = "A".repeat(70 * 1024);
+    let long_annotation = "x".repeat(70 * 1024);
+    let mut gff = String::from(
+        "##gff-version 3\n\
+#source-order-comment\n\
+chr1\ts\texon\t10\t20\t.\t+\t.\tID=exon1;Parent=transcript1\n\
+chr1\ts\tgene\t10\t20\t.\t+\t.\tID=gene1;Name=gene-one\n\
+chr1\ts\ttranscript\t10\t20\t.\t+\t.\tID=transcript1;Parent=gene1\n\
+",
+    );
+    gff.push_str(&format!(
+        "chr2\ts\tgene\t300000000\t300000010\t.\t+\t.\tID=long;Name=longmatch;Note={long_annotation}\n"
+    ));
+    gff.push_str(
+        "chr2\ts\tgene\t600000000\t600000010\t.\t+\t.\tID=after;Name=afterblock\n##FASTA\n>chr1\n",
+    );
+    gff.push_str(&fasta_sequence);
+    gff.push('\n');
+
+    // The .gtf path uses the sorter's existing GFF attribute parser.
+    let gtf = concat!(
+        "#gtf-version 2.2\n",
+        "chr2\ts\texon\t1\t5\t.\t+\t.\tgene_id=g2;transcript_id=t2\n",
+        "chr1\ts\texon\t2\t8\t.\t+\t.\tgene_id=g1;transcript_id=t1\n",
+    );
+    let bed = concat!(
+        "chr2\t0\t5\ttwo\n",
+        "chr1\t10\t30\tlong\n",
+        "chr1\t2\t20\twide\n",
+        "chr1\t2\t10\tfirst\n",
+        "chr1\t2\t10\tsecond\n",
+        "chr3\t2\t2\tpoint\n",
+    );
+    let cases = [
+        ("stream.gff3", gff.into_bytes()),
+        ("stream.gtf", gtf.as_bytes().to_vec()),
+        ("stream.bed", bed.as_bytes().to_vec()),
+    ];
+    let binary = env!("CARGO_BIN_EXE_gai");
+
+    for (file_name, input_bytes) in cases {
+        let input = directory.path().join(file_name);
+        fs::write(&input, input_bytes).expect("should write sort input");
+        let run_sort = || {
+            Command::new(binary)
+                .args(["sort"])
+                .arg(&input)
+                .output()
+                .expect("should run gai sort")
+        };
+
+        let plain = run_sort();
+        assert!(plain.status.success(), "stderr: {:?}", plain.stderr);
+        assert!(!plain.stdout.starts_with(&[0x1f, 0x8b]));
+
+        let output_path = directory.path().join(format!("{file_name}.bgzf"));
+        let explicit_index = file_name == "stream.bed";
+        let index_path = if explicit_index {
+            let index_directory = directory.path().join("indexes");
+            fs::create_dir_all(&index_directory).expect("should create custom index directory");
+            index_directory.join("stream.bed.csi")
+        } else {
+            PathBuf::from(format!("{}.csi", output_path.display()))
+        };
+        let mut compressed_command = Command::new(binary);
+        compressed_command
+            .args(["sort"])
+            .arg(&input)
+            .args(["--compress", "--output"])
+            .arg(&output_path);
+        if explicit_index {
+            compressed_command
+                .arg("--coordinate-index")
+                .arg(&index_path);
+        }
+        let compressed = compressed_command
+            .output()
+            .expect("should run gai sort --compress");
+        assert!(
+            compressed.status.success(),
+            "stderr: {:?}",
+            compressed.stderr
+        );
+        assert!(compressed.stdout.is_empty());
+        let compressed_bytes = fs::read(&output_path).expect("should read BGZF output");
+        let index_bytes = fs::read(&index_path).expect("should read generated CSI");
+        assert_eq!(decode_bgzf(&compressed_bytes), plain.stdout);
+
+        let (region, expected_record) = match file_name {
+            "stream.gff3" => ("chr1:10-20", "ID=gene1"),
+            "stream.gtf" => ("chr1:2-8", "gene_id=g1"),
+            "stream.bed" => ("chr1:11-30", "long"),
+            _ => unreachable!(),
+        };
+        let queried_records = query_csi(&compressed_bytes, &index_bytes, region);
+        assert!(
+            String::from_utf8_lossy(&queried_records).contains(expected_record),
+            "CSI query {region} returned {:?}",
+            String::from_utf8_lossy(&queried_records)
+        );
+
+        if file_name == "stream.gff3" {
+            assert!(plain.stdout.len() > 64 * 1024);
+            let expected_prefix = concat!(
+                "##gff-version 3\n",
+                "#source-order-comment\n",
+                "chr1\ts\tgene\t10\t20\t.\t+\t.\tID=gene1;Name=gene-one\n",
+                "chr1\ts\ttranscript\t10\t20\t.\t+\t.\tID=transcript1;Parent=gene1\n",
+                "chr1\ts\texon\t10\t20\t.\t+\t.\tID=exon1;Parent=transcript1\n",
+                "chr2\ts\tgene\t300000000\t300000010\t.\t+\t.\tID=long;Name=longmatch;Note=",
+            );
+            assert!(plain.stdout.starts_with(expected_prefix.as_bytes()));
+            let expected_fasta_tail = format!("##FASTA\n>chr1\n{fasta_sequence}\n");
+            assert!(plain.stdout.ends_with(expected_fasta_tail.as_bytes()));
+
+            let bgzf_eof = bgzf::io::Writer::new(Vec::new())
+                .finish()
+                .expect("should create a BGZF EOF marker");
+            assert!(compressed_bytes.ends_with(&bgzf_eof));
+            assert!(
+                String::from_utf8_lossy(&query_csi(
+                    &compressed_bytes,
+                    &index_bytes,
+                    "chr2:300000000-300000010"
+                ))
+                .contains("Name=longmatch")
+            );
+            assert!(
+                String::from_utf8_lossy(&query_csi(
+                    &compressed_bytes,
+                    &index_bytes,
+                    "chr2:600000000-600000010"
+                ))
+                .contains("Name=afterblock")
+            );
+
+            let disk_compressed_index = directory.path().join("disk-sorted.csi");
+            let disk_compressed = Command::new(binary)
+                .args(["sort"])
+                .arg(&input)
+                .args(["--disk-sort", "--compress", "--coordinate-index"])
+                .arg(&disk_compressed_index)
+                .output()
+                .expect("should sort compressed stdout and CSI with --disk-sort");
+            assert!(
+                disk_compressed.status.success(),
+                "stderr: {:?}",
+                disk_compressed.stderr
+            );
+            assert_eq!(decode_bgzf(&disk_compressed.stdout), plain.stdout);
+            let stdout_index = fs::read(&disk_compressed_index).expect("should read stdout CSI");
+            assert!(
+                String::from_utf8_lossy(&query_csi(
+                    &disk_compressed.stdout,
+                    &stdout_index,
+                    "chr2:600000000-600000010"
+                ))
+                .contains("Name=afterblock")
+            );
+
+            let attribute_index_path = directory.path().join("stream.gff3.gai");
+            let name_options =
+                NameIndexOptions::new(["Name"], false).expect("should configure GFF Name indexing");
+            build_name_index_with_options(
+                &output_path,
+                &index_path,
+                &attribute_index_path,
+                &name_options,
+                &BuildOptions::default(),
+            )
+            .expect("should build GAI using sort-generated CSI");
+            let matching_records = query_index(
+                &output_path,
+                &index_path,
+                &attribute_index_path,
+                "longmatch",
+            )
+            .expect("should query the generated name and coordinate indexes");
+            assert_eq!(matching_records.len(), 1);
+            assert_eq!(matching_records[0].start, 300_000_000);
+
+            if cfg!(feature = "profiling") {
+                let profile_index = directory.path().join("profile-sorted.csi");
+                let profiled = Command::new(binary)
+                    .args(["profile", "sort"])
+                    .arg(&input)
+                    .args(["--disk-sort", "--compress", "--coordinate-index"])
+                    .arg(&profile_index)
+                    .output()
+                    .expect("should run profiled sort with CSI output");
+                assert!(profiled.status.success(), "stderr: {:?}", profiled.stderr);
+                assert_eq!(decode_bgzf(&profiled.stdout), plain.stdout);
+            }
+        } else if file_name == "stream.bed" {
+            let index = csi::io::Reader::new(Cursor::new(&index_bytes))
+                .read_index()
+                .expect("should read BED CSI");
+            let point_region = "chr3:3-3"
+                .parse::<Region>()
+                .expect("should parse BED point region");
+            assert!(
+                !index
+                    .query(2, point_region.interval())
+                    .expect("should query BED point candidate bins")
+                    .is_empty(),
+                "zero-width BED intervals should be indexed as point candidates"
+            );
+
+            let stdout_index_path = directory.path().join("stdout-sorted.bed.csi");
+            let stdout_compressed = Command::new(binary)
+                .args(["sort"])
+                .arg(&input)
+                .args(["--disk-sort", "--compress", "--coordinate-index"])
+                .arg(&stdout_index_path)
+                .output()
+                .expect("should sort BED to compressed stdout and CSI");
+            assert!(
+                stdout_compressed.status.success(),
+                "stderr: {:?}",
+                stdout_compressed.stderr
+            );
+            assert_eq!(decode_bgzf(&stdout_compressed.stdout), plain.stdout);
+            let stdout_index_bytes =
+                fs::read(&stdout_index_path).expect("should read stdout BED CSI");
+            let stdout_records =
+                query_csi(&stdout_compressed.stdout, &stdout_index_bytes, "chr1:11-30");
+            assert!(String::from_utf8_lossy(&stdout_records).contains("long"));
+        }
+    }
+}
+
+#[test]
+fn cli_sort_compress_requires_destination_and_preserves_final_paths_on_failure() {
+    let directory = tempdir().expect("should create temporary directory");
+    let binary = env!("CARGO_BIN_EXE_gai");
+    let valid_input = directory.path().join("valid.gff3");
+    fs::write(&valid_input, b"chr1\ts\tgene\t1\t2\t.\t+\t.\tName=ok\n")
+        .expect("should write valid GFF input");
+
+    let missing_destination = Command::new(binary)
+        .args(["sort"])
+        .arg(&valid_input)
+        .arg("--compress")
+        .output()
+        .expect("should reject compressed stdout without a CSI destination");
+    assert!(!missing_destination.status.success());
+    assert!(missing_destination.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&missing_destination.stderr)
+            .contains("--compress requires --output or --coordinate-index")
+    );
+
+    let invalid_input = directory.path().join("invalid.gff3");
+    fs::write(&invalid_input, b"not a GFF record\n").expect("should write invalid input");
+    let failed_output = directory.path().join("failed.gff3.bgzf");
+    let failed = Command::new(binary)
+        .args(["sort"])
+        .arg(&invalid_input)
+        .args(["--compress", "--output"])
+        .arg(&failed_output)
+        .output()
+        .expect("should reject malformed GFF");
+    assert!(!failed.status.success());
+    assert!(!failed_output.exists());
+    assert!(!PathBuf::from(format!("{}.csi", failed_output.display())).exists());
+
+    let existing_output = directory.path().join("existing.gff3.bgzf");
+    let existing_index = PathBuf::from(format!("{}.csi", existing_output.display()));
+    fs::write(&existing_output, b"preserve compressed output")
+        .expect("should write existing output sentinel");
+    let rejected_output = Command::new(binary)
+        .args(["sort"])
+        .arg(&valid_input)
+        .args(["--compress", "--output"])
+        .arg(&existing_output)
+        .output()
+        .expect("should reject existing output destination");
+    assert!(!rejected_output.status.success());
+    assert_eq!(
+        fs::read(&existing_output).unwrap(),
+        b"preserve compressed output"
+    );
+    assert!(!existing_index.exists());
+
+    let output_for_existing_index = directory.path().join("index-exists.gff3.bgzf");
+    let existing_index_path = directory.path().join("custom.csi");
+    fs::write(&existing_index_path, b"preserve CSI").expect("should write CSI sentinel");
+    let rejected_index = Command::new(binary)
+        .args(["sort"])
+        .arg(&valid_input)
+        .args(["--compress", "--output"])
+        .arg(&output_for_existing_index)
+        .arg("--coordinate-index")
+        .arg(&existing_index_path)
+        .output()
+        .expect("should reject existing CSI destination");
+    assert!(!rejected_index.status.success());
+    assert!(!output_for_existing_index.exists());
+    assert_eq!(fs::read(&existing_index_path).unwrap(), b"preserve CSI");
+
+    let rejected_stdout_index = Command::new(binary)
+        .args(["sort"])
+        .arg(&valid_input)
+        .args(["--compress", "--coordinate-index"])
+        .arg(&existing_index_path)
+        .output()
+        .expect("should reject existing stdout CSI destination");
+    assert!(!rejected_stdout_index.status.success());
+    assert!(rejected_stdout_index.stdout.is_empty());
+    assert_eq!(fs::read(&existing_index_path).unwrap(), b"preserve CSI");
+
+    let empty_input = directory.path().join("empty.gff3");
+    let empty_output = directory.path().join("empty.gff3.bgzf");
+    fs::write(&empty_input, b"").expect("should write empty input");
+    let empty = Command::new(binary)
+        .args(["sort"])
+        .arg(&empty_input)
+        .args(["--compress", "--output"])
+        .arg(&empty_output)
+        .output()
+        .expect("should compress empty source");
+    assert!(empty.status.success(), "stderr: {:?}", empty.stderr);
+    assert!(decode_bgzf(&fs::read(&empty_output).unwrap()).is_empty());
+    assert!(PathBuf::from(format!("{}.csi", empty_output.display())).exists());
 }

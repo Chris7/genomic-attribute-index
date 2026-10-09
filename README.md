@@ -50,13 +50,31 @@ $ gai inspect-index annotations.gff3.gz.gai
 $ cargo run --features profiling -- profile query annotations.gff3.gz BRCA1
 $ cargo run --features profiling -- profile --sample query annotations.gff3.gz BRCA1
 $ gai sort annotations.gff3 > annotations.sorted.gff3
+$ gai sort annotations.gff3 --compress --output annotations.sorted.gff3.gz
 $ gai sort annotations.bed > annotations.sorted.bed
+$ gai compress annotations.sorted.gff3 --output annotations.recompressed.gff3.gz
 ```
 
 ## Tabix inputs
 
 A coordinate index is discovered from an unambiguous sibling `.tbi` or `.csi`, but
 can be explicitly referenced by the `--coordinate-index` flag. 
+
+## Compressing and coordinate indexing
+
+`gai compress` takes an already coordinate-sorted GFF/GFF3/GTF or BED file, writes it as
+BGZF, and builds a CSI coordinate index during the same pass. The default index path
+is `<output>.csi`; `--coordinate-index` selects another path. Compression preserves
+the input records and does not sort them. Use `gai sort` first when needed.
+When sorting is needed, `gai sort --compress --output` sorts, writes BGZF, and builds
+the CSI in one pass over the sorted output.
+
+```console
+gai sort annotations.gff3 > annotations.sorted.gff3
+gai compress annotations.sorted.gff3 --output annotations.sorted.gff3.gz
+gai build-index annotations.sorted.gff3.gz --attribute Name
+gai query annotations.sorted.gff3.gz BRCA1
+```
 
 ## Building an index
 
@@ -112,6 +130,22 @@ breaker to put parents before children
 For vey large files, `--disk-sort` can be passed to spill to disk for sorting where
 an in-memory sort is not possible.
 
+`--compress` sorts into BGZF while building CSI from the same output stream, without an
+intermediate sorted file. Supplying `--output` writes the BGZF source and its CSI
+(defaulting to `<output>.csi`) directly to named files. To redirect BGZF to stdout, pass
+`--coordinate-index` explicitly so the index has a destination:
+
+```console
+gai sort annotations.gff3 --compress --output annotations.sorted.gff3.gz
+gai sort annotations.gff3 --disk-sort --compress --output annotations.sorted.gff3.gz
+gai sort annotations.gff3 --compress --coordinate-index annotations.sorted.gff3.gz.csi > annotations.sorted.gff3.gz
+```
+
+BGZF output buffers roughly 64 KiB blocks. `--disk-sort` spills sorted chunks instead
+of retaining all records, but uses record counts rather than a strict byte limit;
+GFF comments, tied feature groups, individual long records, and CSI index entries can
+still increase memory use, so there is no hard total memory ceiling.
+
 For GFF files containing sequences, sorting and parsing stops when the `##FASTA` tag
 is encountered. The records are then sorted and the sorted GFF is emited including the
 trailing fasta contents.
@@ -161,10 +195,12 @@ validation, and captured output.
 from pathlib import Path
 import gai
 
-source = Path("annotations.gff3.gz")
-tbi = Path("annotations.gff3.gz.tbi")
-stats = gai.build_index(source, tbi, Path("annotations.gff3.gz.gai"), ["Name", "Alias"])
-indexed = gai.open_index(source, tbi, Path("annotations.gff3.gz.gai"))
+source = Path("annotations.sorted.gff3")
+bgzf_source = Path("annotations.sorted.gff3.gz")
+gai.compress(source, bgzf_source)  # also writes annotations.sorted.gff3.gz.csi
+csi = Path("annotations.sorted.gff3.gz.csi")
+stats = gai.build_index(bgzf_source, csi, Path("annotations.sorted.gff3.gz.gai"), ["Name", "Alias"])
+indexed = gai.open_index(bgzf_source, csi, Path("annotations.sorted.gff3.gz.gai"))
 for record in indexed.query("BRCA1"):  # exact is the default
     print(record.reference_sequence_name, record.start, record.attributes)
 for record in indexed.query("BRCA", match="prefix"):
@@ -182,12 +218,19 @@ print(indexed.metadata().term_count, stats.records_processed)
 Use one-shot helpers for a single query, or keep an `IndexedSource` open for several queries:
 
 ```rust
-use gai::{MatchMode, inspect_index, open_index, query_index, query_index_with_mode};
+use gai::{
+    MatchMode, NameIndexOptions, build_name_index, compress_file, inspect_index, open_index,
+    query_index, query_index_with_mode,
+};
 
 fn main() -> gai::Result<()> {
-    let source = "annotations.gff3.gz";
-    let coordinate_index = "annotations.gff3.gz.tbi";
-    let index = "annotations.gff3.gz.gai";
+    let sorted_source = "annotations.sorted.gff3";
+    let source = "annotations.sorted.gff3.gz";
+    let coordinate_index = "annotations.sorted.gff3.gz.csi";
+    let index = "annotations.sorted.gff3.gz.gai";
+    compress_file(sorted_source, source, None)?;
+    let attributes = NameIndexOptions::new(["Name"], false)?;
+    build_name_index(source, coordinate_index, index, &attributes)?;
 
     let metadata = inspect_index(index)?;
     // Defaults to an exact match

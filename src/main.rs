@@ -1,10 +1,17 @@
-use std::{path::PathBuf, process::ExitCode};
+use std::{
+    io::Write,
+    path::{Path, PathBuf},
+    process::ExitCode,
+};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use gai::{
     BuildOptions, IndexedSource, MatchMode, NameIndexOptions, Result, SortFormat,
-    build_name_index_with_options, sort_file,
+    build_name_index_with_options, compress_file, open_annotation_reader, sort_and_compress_file,
+    sort_bgzf_with_csi, sort_file,
 };
+use noodles::csi;
+use tempfile::NamedTempFile;
 
 #[cfg(feature = "profiling")]
 mod profiling;
@@ -18,9 +25,12 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Sort GFF/GFF3 or BED records and write the result to stdout.
+    /// Sort GFF/GFF3/GTF or BED records and write the result to stdout.
     #[command(name = "sort")]
     Sort(SortArgs),
+    /// Compress an already sorted GFF/GFF3/GTF or BED file to BGZF while building a CSI coordinate index.
+    #[command(name = "compress")]
+    Compress(CompressArgs),
     /// Build a deterministic Genomic Attribute Index (GAI) for configured GFF3 attributes.
     #[command(name = "build-index", visible_alias = "build")]
     Build(BuildIndexArgs),
@@ -48,9 +58,12 @@ struct ProfileArgs {
 #[cfg(feature = "profiling")]
 #[derive(Debug, Subcommand)]
 enum ProfileCommand {
-    /// Sort GFF/GFF3 or BED records and write the result to stdout.
+    /// Sort GFF/GFF3/GTF or BED records and write the result to stdout.
     #[command(name = "sort")]
     Sort(SortArgs),
+    /// Compress an already sorted GFF/GFF3/GTF or BED file to BGZF while building a CSI coordinate index.
+    #[command(name = "compress")]
+    Compress(CompressArgs),
     /// Build a deterministic Genomic Attribute Index (GAI) for configured GFF3 attributes.
     #[command(name = "build-index", visible_alias = "build")]
     Build(BuildIndexArgs),
@@ -67,6 +80,7 @@ impl From<ProfileCommand> for Command {
     fn from(command: ProfileCommand) -> Self {
         match command {
             ProfileCommand::Sort(arguments) => Self::Sort(arguments),
+            ProfileCommand::Compress(arguments) => Self::Compress(arguments),
             ProfileCommand::Build(arguments) => Self::Build(arguments),
             ProfileCommand::Query(arguments) => Self::Query(arguments),
             ProfileCommand::Inspect(arguments) => Self::Inspect(arguments),
@@ -76,11 +90,32 @@ impl From<ProfileCommand> for Command {
 
 #[derive(Debug, Args)]
 struct SortArgs {
-    /// Input .gff, .gff3, or .bed path; sorted output is written to stdout.
+    /// Input .gff, .gff3, .gtf, or .bed path; by default, sorted output is written to stdout.
     input: PathBuf,
     /// Sort on disk; use for files that may fill memory
     #[arg(long, alias = "ds")]
     disk_sort: bool,
+    /// Write sorted output as BGZF.
+    #[arg(long)]
+    compress: bool,
+    /// BGZF destination path; its CSI defaults to <output>.csi. Requires --compress.
+    #[arg(long, requires = "compress")]
+    output: Option<PathBuf>,
+    /// CSI destination. With --compress and no --output, BGZF is written to stdout.
+    #[arg(long = "coordinate-index", requires = "compress")]
+    coordinate_index: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct CompressArgs {
+    /// Already coordinate-sorted GFF/GFF3/GTF or BED input path.
+    input: PathBuf,
+    /// BGZF-compressed destination path.
+    #[arg(long, required = true)]
+    output: PathBuf,
+    /// CSI destination. Defaults to <output>.csi.
+    #[arg(long = "coordinate-index")]
+    coordinate_index: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -174,11 +209,75 @@ fn discover_coordinate_index(input: &std::path::Path) -> Result<PathBuf> {
         ))),
     }
 }
+
+fn stage_csi_path(path: &Path) -> Result<NamedTempFile> {
+    if path.exists() {
+        return Err(gai::Error::InvalidInput(
+            "CSI destination must not already exist".into(),
+        ));
+    }
+
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    Ok(NamedTempFile::new_in(parent)?)
+}
+
+fn publish_csi_index(index: &csi::Index, mut index_temp: NamedTempFile, path: &Path) -> Result<()> {
+    let mut writer = csi::io::Writer::new(index_temp.as_file_mut());
+    writer.write_index(index)?;
+    writer.into_inner().finish()?.flush()?;
+    index_temp.flush()?;
+    index_temp
+        .persist_noclobber(path)
+        .map_err(|error| gai::Error::Io(error.error))?;
+    Ok(())
+}
+
 #[cfg_attr(feature = "profiling", tracing::instrument(level = "trace", skip_all))]
 fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Sort(arguments) => {
-            sort_file(arguments.input, arguments.disk_sort, std::io::stdout())?;
+            if !arguments.compress {
+                sort_file(arguments.input, arguments.disk_sort, std::io::stdout())?;
+            } else if let Some(output_path) = arguments.output.as_deref() {
+                sort_and_compress_file(
+                    &arguments.input,
+                    output_path,
+                    arguments.coordinate_index.as_deref(),
+                    arguments.disk_sort,
+                )?;
+            } else if let Some(index_path) = arguments.coordinate_index.as_deref() {
+                let index_temp = stage_csi_path(index_path)?;
+                let stdout = std::io::stdout();
+                let mut writer = noodles::bgzf::io::Writer::new(stdout.lock());
+                let format = SortFormat::from_path(&arguments.input)?;
+                let reader = open_annotation_reader(&arguments.input)?;
+                let index = sort_bgzf_with_csi(reader, &mut writer, format, arguments.disk_sort)?;
+                writer.finish()?.flush()?;
+                publish_csi_index(&index, index_temp, index_path)?;
+            } else {
+                return Err(gai::Error::InvalidInput(
+                    "--compress requires --output or --coordinate-index".into(),
+                ));
+            }
+        }
+        Command::Compress(arguments) => {
+            let coordinate_index = arguments
+                .coordinate_index
+                .clone()
+                .unwrap_or_else(|| PathBuf::from(format!("{}.csi", arguments.output.display())));
+            compress_file(
+                &arguments.input,
+                &arguments.output,
+                arguments.coordinate_index.as_deref(),
+            )?;
+            println!(
+                "wrote {} and {}",
+                arguments.output.display(),
+                coordinate_index.display()
+            );
         }
         Command::Build(arguments) => {
             let coordinate_index = match arguments.coordinate_index {

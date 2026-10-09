@@ -7,7 +7,8 @@ use std::{
 
 use gai::{
     BuildOptions, Error, GffRecord, IndexMetadata, IndexStats, IndexedSource, MatchMode,
-    NameIndexOptions, QueryStats, SortFormat, build_name_index_with_options, sort_file,
+    NameIndexOptions, QueryStats, SortFormat, build_name_index_with_options, compress_file,
+    sort_file,
 };
 use pyo3::{
     Bound, PyErr, PyResult, Python, create_exception,
@@ -452,6 +453,18 @@ fn sort(py: Python<'_>, input: PathBuf, output: PathBuf, disk_sort: bool) -> PyR
 }
 
 #[pyfunction]
+#[pyo3(signature = (input, output, *, coordinate_index=None))]
+fn compress(
+    py: Python<'_>,
+    input: PathBuf,
+    output: PathBuf,
+    coordinate_index: Option<PathBuf>,
+) -> PyResult<()> {
+    py.allow_threads(move || compress_file(input, output, coordinate_index.as_deref()))
+        .map_err(to_py_error)
+}
+
+#[pyfunction]
 #[pyo3(signature = (input, coordinate_index, output, attributes, case_sensitive=false, memory_budget=67108864, compression_threads=None, bgzf_threads=None))]
 #[allow(clippy::too_many_arguments)]
 fn build_index(
@@ -551,6 +564,7 @@ fn _gai(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyQueryStats>()?;
     m.add_class::<PyIndexedSource>()?;
     m.add_function(wrap_pyfunction!(sort, m)?)?;
+    m.add_function(wrap_pyfunction!(compress, m)?)?;
     m.add_function(wrap_pyfunction!(build_index, m)?)?;
     m.add_function(wrap_pyfunction!(open_index, m)?)?;
     m.add_function(wrap_pyfunction!(query_index, m)?)?;

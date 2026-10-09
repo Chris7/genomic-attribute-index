@@ -1,11 +1,19 @@
-use std::{fs::File, io::Write, path::Path, process::Command};
+use std::{
+    fs::File,
+    io::{Read, Write},
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use gai::{
     MatchMode, NameIndexOptions, build_name_index, inspect_index, open_index, query_index,
     query_index_with_mode,
 };
 use noodles::{
-    bgzf, core::Position, csi::binning_index::index::reference_sequence::bin::Chunk, tabix,
+    bgzf,
+    core::{Position, Region},
+    csi::binning_index::index::reference_sequence::bin::Chunk,
+    tabix,
 };
 use tempfile::tempdir;
 
@@ -426,6 +434,7 @@ fn cli_index_query_and_inspect() {
     assert!(help.contains("build-index"));
     assert!(help.contains("query-index"));
     assert!(help.contains("inspect-index"));
+    assert!(help.contains("compress"));
     assert!(help.contains("[alias: build]"));
     assert!(help.contains("[alias: query]"));
     assert!(help.contains("[alias: inspect]"));
@@ -436,6 +445,16 @@ fn cli_index_query_and_inspect() {
     );
     assert!(!help.contains("gff"));
 
+    let compress_help = Command::new(binary)
+        .args(["compress", "--help"])
+        .output()
+        .expect("should show compression help");
+    assert!(compress_help.status.success());
+    let compress_help = String::from_utf8_lossy(&compress_help.stdout);
+    assert!(compress_help.contains("coordinate-sorted"));
+    assert!(compress_help.contains("--output"));
+    assert!(compress_help.contains("CSI destination"));
+
     let old_surface = Command::new(binary)
         .args(["gff", "query-name", &source, "BRCA1"])
         .output()
@@ -443,6 +462,151 @@ fn cli_index_query_and_inspect() {
     assert!(!old_surface.status.success());
 }
 
+#[test]
+fn test_cli_compress_builds_and_queries_csi_for_large_gff_gtf_and_bed() {
+    let directory = tempdir().expect("should create temp directory");
+    let binary = env!("CARGO_BIN_EXE_gai");
+    let gff_record = "chr1\tsrc\tgene\t600000001\t600000010\t.\t+\t.\tName=LargeGene";
+    let gtf_record = "chr1\tsrc\tgene\t600000001\t600000010\t.\t+\t.\tgene_id \"large\"; gene_name \"LargeGtf\";";
+    let bed_record = "chr1\t600000000\t600000010\tLargeBed";
+    let cases = [
+        (
+            "gff3",
+            "gff3",
+            format!("##gff-version 3\n{gff_record}\n"),
+            gff_record,
+            Some(("Name", "LargeGene")),
+            false,
+        ),
+        (
+            "gtf",
+            "gtf",
+            format!("{gtf_record}\n"),
+            gtf_record,
+            None,
+            false,
+        ),
+        (
+            "bed",
+            "bed",
+            format!("{bed_record}\n"),
+            bed_record,
+            Some(("", "LargeBed")),
+            true,
+        ),
+    ];
+
+    for (
+        label,
+        extension,
+        source_contents,
+        expected_record,
+        attribute_query,
+        custom_coordinate_index,
+    ) in cases
+    {
+        let source = directory.path().join(format!("large.{extension}"));
+        let output = directory.path().join(format!("large.{extension}.gz"));
+        let default_coordinate_index = PathBuf::from(format!("{}.csi", output.display()));
+        let custom_path = directory.path().join(format!("{label}.coordinate.csi"));
+        std::fs::write(&source, &source_contents).expect("should write sorted source");
+
+        let mut command = Command::new(binary);
+        command.args(["compress", source.to_str().unwrap(), "--output"]);
+        command.arg(&output);
+        let coordinate_index = if custom_coordinate_index {
+            command.args(["--coordinate-index", custom_path.to_str().unwrap()]);
+            &custom_path
+        } else {
+            &default_coordinate_index
+        };
+        let compressed = command.output().expect("should run gai compress");
+        assert!(
+            compressed.status.success(),
+            "stderr: {:?}",
+            compressed.stderr
+        );
+        assert!(output.exists());
+        assert!(coordinate_index.exists());
+        assert!(!PathBuf::from(format!("{}.tbi", output.display())).exists());
+
+        let mut reader = bgzf::io::Reader::new(
+            File::open(&output).expect("should open compressed annotation source"),
+        );
+        let mut decompressed = String::new();
+        reader
+            .read_to_string(&mut decompressed)
+            .expect("should decompress annotation source");
+        assert_eq!(decompressed, source_contents);
+
+        let index = noodles::csi::io::Reader::new(
+            File::open(coordinate_index).expect("should open generated CSI"),
+        )
+        .read_index()
+        .expect("should parse generated CSI");
+        let region = "chr1:600000001-600000010"
+            .parse::<Region>()
+            .expect("should parse large query region");
+        let mut indexed_reader = noodles::csi::io::IndexedReader::new(
+            File::open(&output).expect("should open BGZF source"),
+            index,
+        );
+        let indexed_records = indexed_reader
+            .query(&region)
+            .expect("should query generated CSI")
+            .map(|result| {
+                result
+                    .expect("should read CSI record")
+                    .as_ref()
+                    .as_bytes()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>()
+            .concat();
+        assert_eq!(String::from_utf8_lossy(&indexed_records), expected_record);
+
+        if let Some((attribute, term)) = attribute_query {
+            let destination = directory.path().join(format!("{label}.gai"));
+            let mut build = Command::new(binary);
+            build.args(["build-index", output.to_str().unwrap()]);
+            if !attribute.is_empty() {
+                build.args(["--attribute", attribute]);
+            }
+            if custom_coordinate_index {
+                build.args(["--coordinate-index", coordinate_index.to_str().unwrap()]);
+            }
+            build.arg("--output").arg(&destination);
+            let indexed = build.output().expect("should build GAI through CLI");
+            assert!(indexed.status.success(), "stderr: {:?}", indexed.stderr);
+
+            let mut query = Command::new(binary);
+            query.args(["query-index", output.to_str().unwrap(), term, "--gai"]);
+            query.arg(&destination);
+            if custom_coordinate_index {
+                query.args(["--coordinate-index", coordinate_index.to_str().unwrap()]);
+            }
+            let queried = query.output().expect("should query GAI through CLI");
+            assert!(queried.status.success(), "stderr: {:?}", queried.stderr);
+            assert_eq!(
+                String::from_utf8_lossy(&queried.stdout),
+                format!("{expected_record}\n")
+            );
+        }
+
+        if label == "gff3" && cfg!(feature = "profiling") {
+            let profile_output = directory.path().join("profiled.gff3.gz");
+            let profiled = Command::new(binary)
+                .args(["profile", "compress", source.to_str().unwrap(), "--output"])
+                .arg(&profile_output)
+                .output()
+                .expect("should run profile compress");
+            assert!(profiled.status.success(), "stderr: {:?}", profiled.stderr);
+            assert!(profile_output.exists());
+            assert!(PathBuf::from(format!("{}.csi", profile_output.display())).exists());
+            assert!(String::from_utf8_lossy(&profiled.stderr).contains("Profile results"));
+        }
+    }
+}
 #[test]
 fn cli_query_filters_exact_repeatable_contig_names_for_gff_and_bed() {
     let directory = tempdir().expect("should create temp directory");

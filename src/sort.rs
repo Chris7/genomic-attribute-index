@@ -78,8 +78,12 @@ impl SortFormat {
         }
     }
 }
+/// Opens a plain annotation file or a `.gz`, `.bgz`, or `.bgzf` file as a buffered reader.
+///
+/// Compressed suffixes are decoded as gzip/BGZF; all other suffixes are read as plain text.
 #[cfg_attr(feature = "profiling", tracing::instrument(level = "trace", skip_all))]
-pub fn open_reader(path: &Path) -> io::Result<Box<dyn BufRead>> {
+pub fn open_annotation_reader(path: impl AsRef<Path>) -> io::Result<Box<dyn BufRead>> {
+    let path = path.as_ref();
     let file = File::open(path)?;
     let reader = BufReader::new(file);
 
@@ -102,7 +106,7 @@ pub fn open_reader(path: &Path) -> io::Result<Box<dyn BufRead>> {
 pub fn sort_file(input: impl AsRef<Path>, disk_sort: bool, writer: impl Write) -> Result<()> {
     let input = input.as_ref();
     let format = SortFormat::from_path(input)?;
-    let reader = open_reader(input)?;
+    let reader = open_annotation_reader(input)?;
     match format {
         SortFormat::Gff => sort_gff(reader, disk_sort, writer),
         SortFormat::Bed => sort_bed(reader, disk_sort, writer),

@@ -4,8 +4,8 @@
 //! It is intentionally not a feature-identity index: `ID` is just another
 //! attribute, and only names supplied in [`NameIndexOptions`] are searchable.
 //! Coordinates in the on-disk format are zero-based, half-open `start +
-//! length` tuples.  TBI/CSI remains responsible for locating source records;
-//! GAI stores no BGZF virtual offsets.
+//! length` tuples. CSI (or an existing TBI) remains responsible for locating
+//! source records; GAI stores no BGZF virtual offsets.
 //!
 //! # Rust querying API
 //!
@@ -16,7 +16,7 @@
 //!
 //! # fn main() -> gai::Result<()> {
 //! let source = "annotations.gff3.gz";
-//! let coordinate_index = "annotations.gff3.gz.tbi";
+//! let coordinate_index = "annotations.gff3.gz.csi";
 //! let index = "annotations.gff3.gz.gai";
 //! let metadata = inspect_index(index)?;
 //! let exact = query_index(source, coordinate_index, index, "BRCA1")?;
@@ -91,10 +91,14 @@ use sha2::{Digest, Sha256};
 mod index;
 mod query;
 mod sort;
+mod streaming;
 
 pub use index::*;
 pub use query::{IndexedSource, NameIndexReader};
-pub use sort::{SortFormat, sort_bed, sort_file, sort_gff};
+pub use sort::{SortFormat, open_annotation_reader, sort_bed, sort_file, sort_gff};
+pub use streaming::{
+    compress_file, sort_and_compress_file, sort_bgzf_with_csi, write_bgzf_with_csi,
+};
 
 /// Opens a GFF3 or BED source with its coordinate index and GAI.
 ///
