@@ -52,6 +52,72 @@ fn write_fixture(directory: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
     (source_path, index_path)
 }
 
+#[derive(Clone, Copy)]
+enum FixtureFormat {
+    Gff,
+    Bed,
+}
+
+fn write_multi_contig_fixture(
+    directory: &Path,
+    source_name: &str,
+    format: FixtureFormat,
+    lines: &[&str],
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let source_path = directory.join(source_name);
+    let index_path = std::path::PathBuf::from(format!("{}.tbi", source_path.display()));
+    let mut writer = File::create(&source_path)
+        .map(bgzf::io::Writer::new)
+        .expect("should create BGZF source");
+    let mut indexer = tabix::index::Indexer::default();
+    let is_gff = matches!(format, FixtureFormat::Gff);
+    let header = if is_gff {
+        noodles::csi::binning_index::index::header::Builder::gff().build()
+    } else {
+        noodles::csi::binning_index::index::header::Builder::bed().build()
+    };
+    indexer.set_header(header);
+
+    for line in lines {
+        if line.starts_with('#') {
+            writeln!(writer, "{line}").expect("should write directive");
+            continue;
+        }
+        let fields = line.split('\t').collect::<Vec<_>>();
+        let (reference, start, end) = if is_gff {
+            (
+                fields[0],
+                fields[3].parse::<usize>().unwrap(),
+                fields[4].parse::<usize>().unwrap(),
+            )
+        } else {
+            let start = fields[1].parse::<usize>().unwrap();
+            (fields[0], start + 1, fields[2].parse::<usize>().unwrap())
+        };
+        let start = Position::try_from(start).unwrap();
+        let end = Position::try_from(end).unwrap();
+        let start_position = writer.virtual_position();
+        writeln!(writer, "{line}").expect("should write record");
+        let end_position = writer.virtual_position();
+        indexer
+            .add_record(
+                reference,
+                start,
+                end,
+                Chunk::new(start_position, end_position),
+            )
+            .expect("should index record");
+    }
+    writer.finish().expect("should finish BGZF");
+    let index = indexer.build();
+    let mut index_writer = File::create(&index_path)
+        .map(tabix::io::Writer::new)
+        .expect("should create TBI");
+    index_writer.write_index(&index).expect("should write TBI");
+    drop(index_writer);
+    (source_path, index_path)
+}
+
 #[test]
 fn cli_index_query_and_inspect() {
     let directory = tempdir().expect("should create temp directory");
@@ -375,6 +441,226 @@ fn cli_index_query_and_inspect() {
         .output()
         .expect("should run removed command check");
     assert!(!old_surface.status.success());
+}
+
+#[test]
+fn cli_query_filters_exact_repeatable_contig_names_for_gff_and_bed() {
+    let directory = tempdir().expect("should create temp directory");
+    let binary = env!("CARGO_BIN_EXE_gai");
+    let gff_records = [
+        "##gff-version 3",
+        "chr2\tsrc\tgene\t10\t20\t.\t+\t.\tName=Shared",
+        "chr1\tsrc\tgene\t30\t40\t.\t+\t.\tName=Shared",
+        "chr1\tsrc\tgene\t70\t80\t.\t+\t.\tName=Shared",
+        "chr1\tsrc\tgene\t90\t100\t.\t+\t.\tName=SharedLong",
+        "chr3\tsrc\tgene\t110\t120\t.\t+\t.\tName=Shared",
+    ];
+    let bed_records = [
+        "chr2\t0\t10\tShared",
+        "chr1\t20\t30\tShared",
+        "chr1\t60\t70\tShared",
+        "chr1\t80\t90\tSharedLong",
+        "chr3\t100\t110\tShared",
+    ];
+    let cases = [
+        (FixtureFormat::Gff, "multi-contig.gff3.gz", &gff_records[..]),
+        (FixtureFormat::Bed, "multi-contig.bed.gz", &bed_records[..]),
+    ];
+
+    let query_help = Command::new(binary)
+        .args(["query-index", "--help"])
+        .output()
+        .expect("should show query-index help");
+    assert!(query_help.status.success());
+    let query_help = String::from_utf8_lossy(&query_help.stdout);
+    assert!(query_help.contains("--contig <CONTIG>"));
+    assert!(query_help.contains("case-insensitive contig name"));
+    assert!(query_help.contains("may be repeated"));
+
+    for (format, source_name, records) in cases {
+        let (source, coordinate_index) =
+            write_multi_contig_fixture(directory.path(), source_name, format, records);
+        let destination = directory.path().join(format!("{source_name}.gai"));
+        let source = source.to_string_lossy().into_owned();
+        let coordinate_index = coordinate_index.to_string_lossy().into_owned();
+        let destination = destination.to_string_lossy().into_owned();
+        let attribute = if matches!(format, FixtureFormat::Gff) {
+            "Name"
+        } else {
+            "ignored"
+        };
+        let indexed = Command::new(binary)
+            .args([
+                "build-index",
+                &source,
+                "--attribute",
+                attribute,
+                "--coordinate-index",
+                &coordinate_index,
+                "--output",
+                &destination,
+            ])
+            .output()
+            .expect("should build multi-contig GAI");
+        assert!(indexed.status.success(), "stderr: {:?}", indexed.stderr);
+
+        let query =
+            |prefix: &[&str], command: &str, term: &str, mode: Option<&str>, contigs: &[&str]| {
+                let mut arguments = prefix
+                    .iter()
+                    .map(|argument| (*argument).to_owned())
+                    .collect::<Vec<_>>();
+                arguments.extend([
+                    command.to_owned(),
+                    source.clone(),
+                    term.to_owned(),
+                    "--coordinate-index".to_owned(),
+                    coordinate_index.clone(),
+                    "--gai".to_owned(),
+                    destination.clone(),
+                ]);
+                if let Some(mode) = mode {
+                    arguments.push("--match".to_owned());
+                    arguments.push(mode.to_owned());
+                }
+                for contig in contigs {
+                    arguments.push("--contig".to_owned());
+                    arguments.push((*contig).to_owned());
+                }
+                Command::new(binary)
+                    .args(arguments)
+                    .output()
+                    .expect("should query multi-contig index")
+            };
+        let assert_records = |output: &std::process::Output, expected: &[&str]| {
+            assert!(output.status.success(), "stderr: {:?}", output.stderr);
+            let actual = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            let expected = expected
+                .iter()
+                .map(|record| (*record).to_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected);
+        };
+        let expected_all = records
+            .iter()
+            .filter(|record| record.ends_with("=Shared") || record.ends_with("\tShared"))
+            .copied()
+            .collect::<Vec<_>>();
+        let expected_chr1 = expected_all
+            .iter()
+            .filter(|record| record.starts_with("chr1\t"))
+            .copied()
+            .collect::<Vec<_>>();
+        let expected_chr1_prefix = records
+            .iter()
+            .filter(|record| record.starts_with("chr1\t"))
+            .copied()
+            .collect::<Vec<_>>();
+        let expected_multiple_contigs = expected_all
+            .iter()
+            .filter(|record| record.starts_with("chr1\t") || record.starts_with("chr2\t"))
+            .copied()
+            .collect::<Vec<_>>();
+
+        let mut indexed_api =
+            open_index(&source, &coordinate_index, &destination).expect("should open GAI API");
+        let exact_api = indexed_api
+            .query_on_contigs("SHARED", &["CHR1", "cHr2"])
+            .expect("should run exact default contig query");
+        assert_eq!(
+            exact_api
+                .iter()
+                .map(|record| record.raw_line.as_str())
+                .collect::<Vec<_>>(),
+            expected_multiple_contigs
+        );
+
+        let prefix_api = indexed_api
+            .query_on_contigs_with_mode("SHA", &["cHr1"], MatchMode::Prefix)
+            .expect("should run prefix contig query");
+        assert_eq!(
+            prefix_api
+                .iter()
+                .map(|record| record.raw_line.as_str())
+                .collect::<Vec<_>>(),
+            expected_chr1_prefix
+        );
+
+        let (exact_with_stats, exact_stats) = indexed_api
+            .query_on_contigs_with_stats("SHARED", &["CHR1", "cHr2"])
+            .expect("should run exact default contig query with stats");
+        assert_eq!(
+            exact_with_stats
+                .iter()
+                .map(|record| record.raw_line.as_str())
+                .collect::<Vec<_>>(),
+            expected_multiple_contigs
+        );
+        assert_eq!(
+            exact_stats.requested_spans,
+            expected_multiple_contigs.len() as u64
+        );
+        assert_eq!(
+            exact_stats.matching_records,
+            expected_multiple_contigs.len() as u64
+        );
+
+        let (prefix_with_stats, prefix_stats) = indexed_api
+            .query_on_contigs_with_mode_and_stats("SHA", &["cHr1"], MatchMode::Prefix)
+            .expect("should run prefix contig query with stats");
+        assert_eq!(
+            prefix_with_stats
+                .iter()
+                .map(|record| record.raw_line.as_str())
+                .collect::<Vec<_>>(),
+            expected_chr1_prefix
+        );
+        assert_eq!(
+            prefix_stats.requested_spans,
+            expected_chr1_prefix.len() as u64
+        );
+        assert_eq!(
+            prefix_stats.matching_records,
+            expected_chr1_prefix.len() as u64
+        );
+
+        let all = query(&[], "query-index", "SHARED", None, &[]);
+        assert_records(&all, &expected_all);
+
+        let chr1 = query(&[], "query", "SHARED", None, &["cHr1"]);
+        assert_records(&chr1, &expected_chr1);
+
+        let repeated = query(
+            &[],
+            "query-index",
+            "SHARED",
+            None,
+            &["CHR1", "cHr2", "cHr1"],
+        );
+        assert_records(&repeated, &expected_multiple_contigs);
+
+        let unknown = query(&[], "query-index", "SHARED", None, &["missing"]);
+        assert_records(&unknown, &[]);
+
+        let mixed_case = query(&[], "query-index", "SHARED", None, &["cHR1"]);
+        assert_records(&mixed_case, &expected_chr1);
+
+        let prefix = query(&[], "query-index", "SHA", Some("prefix"), &["cHr1"]);
+        assert_records(&prefix, &expected_chr1_prefix);
+
+        if cfg!(feature = "profiling") {
+            let profiled = query(&["profile"], "query", "SHARED", None, &["chr2"]);
+            let expected_chr2 = expected_all
+                .iter()
+                .filter(|record| record.starts_with("chr2\t"))
+                .copied()
+                .collect::<Vec<_>>();
+            assert_records(&profiled, &expected_chr2);
+        }
+    }
 }
 
 #[test]

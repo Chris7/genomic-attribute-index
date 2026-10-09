@@ -101,6 +101,73 @@ mod tests {
 
     #[test]
     #[cfg_attr(feature = "profiling", tracing::instrument(level = "trace", skip_all))]
+    fn test_reference_filtered_bed_queries_limit_coordinate_io() {
+        let directory = tempdir().expect("should create temporary directory");
+        let (source, coordinate_index) = write_bed_fixture(directory.path());
+        let destination = directory.path().join("reference-filtered.bed.gai");
+        build_name_index(
+            &source,
+            &coordinate_index,
+            &destination,
+            &NameIndexOptions::new(["Ignored"], false).unwrap(),
+        )
+        .expect("should build reference-filtered BED GAI");
+        let mut indexed = IndexedSource::open(&source, &coordinate_index, &destination)
+            .expect("should open reference-filtered BED source");
+
+        let (exact, exact_stats) = indexed
+            .query_on_contigs_with_mode_and_stats("alpha", &["chr1"], MatchMode::Exact)
+            .expect("should query exact BED name on one reference");
+        assert_eq!(exact.len(), 1);
+        assert_eq!(exact[0].raw_line, "chr1\t0\t10\tAlpha");
+        assert_eq!(exact_stats.requested_spans, 1);
+        assert_eq!(exact_stats.distinct_span_blocks_decoded, 1);
+        assert_eq!(exact_stats.exact_interval_queries, 1);
+        assert_eq!(exact_stats.matching_records, 1);
+        assert!(exact_stats.unique_candidate_records < 4);
+
+        let (mixed_case, mixed_case_stats) = indexed
+            .query_on_contigs_with_mode_and_stats("alpha", &["CHR1"], MatchMode::Exact)
+            .expect("should match BED reference names without regard to case");
+        assert_eq!(mixed_case, exact);
+        assert_eq!(mixed_case_stats, exact_stats);
+
+        let (prefix, prefix_stats) = indexed
+            .query_on_contigs_with_mode_and_stats("al", &["cHr2"], MatchMode::Prefix)
+            .expect("should query BED name prefix on one reference");
+        assert_eq!(prefix.len(), 1);
+        assert_eq!(prefix[0].raw_line, "chr2\t5\t7\tAlpha");
+        assert_eq!(prefix_stats.requested_spans, 1);
+        assert_eq!(prefix_stats.exact_interval_queries, 1);
+        assert!(prefix_stats.unique_candidate_records < 4);
+
+        let (contains, contains_stats) = indexed
+            .query_on_contigs_with_mode_and_stats("ph", &["chr1"], MatchMode::Contains)
+            .expect("should query BED name substring on one reference");
+        assert_eq!(contains.len(), 1);
+        assert_eq!(contains[0].raw_line, "chr1\t0\t10\tAlpha");
+        assert_eq!(contains_stats.requested_spans, 1);
+        assert_eq!(contains_stats.exact_interval_queries, 1);
+
+        for references in [&[][..], &["missing"][..]] {
+            let (records, stats) = indexed
+                .query_on_contigs_with_mode_and_stats("alpha", references, MatchMode::Exact)
+                .expect("should accept empty or unknown reference filters");
+            assert!(records.is_empty());
+            assert_eq!(stats, QueryStats::default());
+        }
+
+        for references in [&["chr"][..], &["hr1"][..], &["chr1_alt"][..]] {
+            let (records, stats) = indexed
+                .query_on_contigs_with_mode_and_stats("alpha", references, MatchMode::Exact)
+                .expect("should require an exact contig name");
+            assert!(records.is_empty());
+            assert_eq!(stats, QueryStats::default());
+        }
+    }
+
+    #[test]
+    #[cfg_attr(feature = "profiling", tracing::instrument(level = "trace", skip_all))]
     fn test_bed_name_index_builds_from_column_four() {
         let directory = tempdir().expect("should create temp directory");
         let (source, coordinate_index) = write_bed_fixture(directory.path());

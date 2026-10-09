@@ -42,6 +42,7 @@ index and compress poorer, which is shown in [Benchmarks](#benchmarks).
 $ gai build annotations.gff3.gz \
     --attribute Name --attribute Alias --attribute gene_name
 $ gai query annotations.gff3.gz BRCA1
+$ gai query annotations.gff3.gz BRCA1 --contig chr17
 $ gai query annotations.gff3.gz BRCA --match prefix
 $ gai query annotations.gff3.gz RCA --match contains
 $ gai query annotations.gff3.gz '^BRCA[0-9]+$' --match regex
@@ -83,7 +84,10 @@ gai query annotations.gff3.gz brca --match prefix
 ```
 
 Queries are an exact match by default. Case sensitivity is dictated by the index building.
-The matching mode can be changed via the `--match` flag, with the following choices:
+Use repeatable `--contig` options to restrict results to exact, case-insensitive contig names,
+for example `--contig chr17 --contig chr12`. Contig matching is independent of the index's
+`--case-sensitive` option for attribute or BED name values. The matching mode can be changed
+via the `--match` flag, with the following choices:
 
 * `--match prefix` matches values beginning with the query
 * `--match contains` matches a literal substring anywhere in a value.
@@ -200,9 +204,25 @@ fn main() -> gai::Result<()> {
     // Defaults to an exact match
     let reusable_exact = indexed.query("BRCA1")?;
     let reusable_prefix = indexed.query_with_mode("BRCA", MatchMode::Prefix)?;
-    // For performance counters, use the stats variant:
+    let contig_exact = indexed.query_on_contigs("BRCA1", &["chr17"])?;
+    let contig_prefix =
+        indexed.query_on_contigs_with_mode("BRCA", &["chr17"], MatchMode::Prefix)?;
+    // Optional query statistics:
+    // let (records, stats) = indexed.query_on_contigs_with_stats("BRCA1", &["chr17"])?;
+    // let (records, stats) = indexed.query_on_contigs_with_mode_and_stats(
+    //     "BRCA", &["chr17"], MatchMode::Prefix,
+    // )?;
+    // For whole-source performance counters, use the stats variant:
     // let (records, stats) = indexed.query_with_mode_and_stats("BRCA", MatchMode::Prefix)?;
-    let _ = (metadata, exact, prefix, reusable_exact, reusable_prefix);
+    let _ = (
+        metadata,
+        exact,
+        prefix,
+        reusable_exact,
+        reusable_prefix,
+        contig_exact,
+        contig_prefix,
+    );
     Ok(())
 }
 ```

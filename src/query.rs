@@ -530,6 +530,42 @@ impl NameIndexReader {
             .ok_or_else(|| Error::Corrupt("missing span ID".into()))
     }
 
+    fn filter_span_ids_by_reference_ids(
+        &self,
+        span_ids: &[u64],
+        reference_ids: &HashSet<u32>,
+    ) -> Result<Vec<u64>> {
+        let mut filtered_span_ids = Vec::with_capacity(span_ids.len());
+        for &span_id in span_ids {
+            let (_, entry, _) = self.span_directory_entry_for_id(span_id)?;
+            if reference_ids.contains(&entry.reference_id) {
+                filtered_span_ids.push(span_id);
+            }
+        }
+        Ok(filtered_span_ids)
+    }
+
+    fn span_directory_entry_for_id(
+        &self,
+        span_id: u64,
+    ) -> Result<(usize, &SpanDirectoryEntry, usize)> {
+        if span_id >= self.metadata.unique_span_count {
+            return Err(Error::Corrupt("invalid span ID".into()));
+        }
+        let block_index = self
+            .span_directory
+            .partition_point(|entry| entry.first_span_id <= span_id)
+            .checked_sub(1)
+            .ok_or_else(|| Error::Corrupt("span ID is outside span directory".into()))?;
+        let entry = &self.span_directory[block_index];
+        let row = usize::try_from(span_id - entry.first_span_id)
+            .map_err(|_| Error::Corrupt("span row overflows usize".into()))?;
+        if row >= entry.span_count as usize {
+            return Err(Error::Corrupt("span ID is outside span block".into()));
+        }
+        Ok((block_index, entry, row))
+    }
+
     /// Resolves a batch of span IDs while decoding each referenced span block
     /// at most once. The input and output retain the same order.
     #[cfg_attr(feature = "profiling", tracing::instrument(level = "trace", skip_all))]
@@ -542,20 +578,7 @@ impl NameIndexReader {
     fn resolve_span_ids_with_stats(&self, span_ids: &[u64]) -> Result<(Vec<Span>, u64, u64)> {
         let mut requests = BTreeMap::<usize, Vec<(usize, usize)>>::new();
         for (output_index, &span_id) in span_ids.iter().enumerate() {
-            if span_id >= self.metadata.unique_span_count {
-                return Err(Error::Corrupt("invalid span ID".into()));
-            }
-            let block_index = self
-                .span_directory
-                .partition_point(|entry| entry.first_span_id <= span_id)
-                .checked_sub(1)
-                .ok_or_else(|| Error::Corrupt("span ID is outside span directory".into()))?;
-            let entry = &self.span_directory[block_index];
-            let row = usize::try_from(span_id - entry.first_span_id)
-                .map_err(|_| Error::Corrupt("span row overflows usize".into()))?;
-            if row >= entry.span_count as usize {
-                return Err(Error::Corrupt("span ID is outside span block".into()));
-            }
+            let (block_index, _, row) = self.span_directory_entry_for_id(span_id)?;
             requests
                 .entry(block_index)
                 .or_default()
@@ -1303,15 +1326,105 @@ impl IndexedSource {
         term: &str,
         match_mode: MatchMode,
     ) -> Result<(Vec<GffRecord>, QueryStats)> {
+        self.query_name_with_mode_and_stats_for_reference_ids(term, match_mode, None)
+    }
+
+    /// Queries an attribute value or BED name with exact term matching on the
+    /// named contigs.
+    ///
+    /// Contig names are matched exactly, ignoring ASCII letter case, regardless
+    /// of term matching mode or attribute normalization. Results are returned
+    /// in source coordinate order. An empty list or one with no matching
+    /// contigs returns no records.
+    #[cfg_attr(feature = "profiling", tracing::instrument(level = "trace", skip_all))]
+    pub fn query_on_contigs(&mut self, term: &str, contigs: &[&str]) -> Result<Vec<GffRecord>> {
+        self.query_on_contigs_with_mode(term, contigs, MatchMode::Exact)
+    }
+
+    /// Queries with an explicit term match mode on the named contigs.
+    ///
+    /// Contig names are matched exactly, ignoring ASCII letter case, regardless
+    /// of term matching mode or attribute normalization. Results are returned
+    /// in source coordinate order. An empty list or one with no matching
+    /// contigs returns no records.
+    #[cfg_attr(feature = "profiling", tracing::instrument(level = "trace", skip_all))]
+    pub fn query_on_contigs_with_mode(
+        &mut self,
+        term: &str,
+        contigs: &[&str],
+        match_mode: MatchMode,
+    ) -> Result<Vec<GffRecord>> {
+        self.query_on_contigs_with_mode_and_stats(term, contigs, match_mode)
+            .map(|(records, _)| records)
+    }
+
+    /// Queries with exact term matching on the named contigs and returns
+    /// bounded query statistics.
+    ///
+    /// Contig names are matched exactly, ignoring ASCII letter case, regardless
+    /// of term matching mode or attribute normalization. Results are returned
+    /// in source coordinate order. An empty list or one with no matching
+    /// contigs returns no records.
+    #[cfg_attr(feature = "profiling", tracing::instrument(level = "trace", skip_all))]
+    pub fn query_on_contigs_with_stats(
+        &mut self,
+        term: &str,
+        contigs: &[&str],
+    ) -> Result<(Vec<GffRecord>, QueryStats)> {
+        self.query_on_contigs_with_mode_and_stats(term, contigs, MatchMode::Exact)
+    }
+
+    /// Queries with an explicit term match mode on the named contigs and
+    /// returns bounded query statistics.
+    ///
+    /// Contig names are matched exactly, ignoring ASCII letter case, regardless
+    /// of term matching mode or attribute normalization. Results are returned
+    /// in source coordinate order. An empty list or one with no matching
+    /// contigs returns no records.
+    #[cfg_attr(feature = "profiling", tracing::instrument(level = "trace", skip_all))]
+    pub fn query_on_contigs_with_mode_and_stats(
+        &mut self,
+        term: &str,
+        contigs: &[&str],
+        match_mode: MatchMode,
+    ) -> Result<(Vec<GffRecord>, QueryStats)> {
+        let reference_ids = self
+            .reference_ids
+            .iter()
+            .filter(|(name, _)| {
+                contigs
+                    .iter()
+                    .any(|contig| name.eq_ignore_ascii_case(contig))
+            })
+            .map(|(_, reference_id)| *reference_id)
+            .collect::<HashSet<_>>();
+        self.query_name_with_mode_and_stats_for_reference_ids(
+            term,
+            match_mode,
+            Some(&reference_ids),
+        )
+    }
+
+    fn query_name_with_mode_and_stats_for_reference_ids(
+        &mut self,
+        term: &str,
+        match_mode: MatchMode,
+        requested_reference_ids: Option<&HashSet<u32>>,
+    ) -> Result<(Vec<GffRecord>, QueryStats)> {
         let matcher =
             CompiledMatch::new(term, match_mode, self.name_index.metadata.case_sensitive)?;
-        if matcher.is_empty() {
+        if matcher.is_empty() || requested_reference_ids.is_some_and(|ids| ids.is_empty()) {
             return Ok((Vec::new(), QueryStats::default()));
         }
-        let span_ids = self
+        let mut span_ids = self
             .name_index
             .lookup_span_ids_with_matcher_and_stats(&matcher)?
             .0;
+        if let Some(requested_reference_ids) = requested_reference_ids {
+            span_ids = self
+                .name_index
+                .filter_span_ids_by_reference_ids(&span_ids, requested_reference_ids)?;
+        }
         let mut stats = QueryStats {
             requested_spans: span_ids.len() as u64,
             ..QueryStats::default()

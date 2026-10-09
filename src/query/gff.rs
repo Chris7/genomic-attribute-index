@@ -426,6 +426,131 @@ mod tests {
 
     #[test]
     #[cfg_attr(feature = "profiling", tracing::instrument(level = "trace", skip_all))]
+    fn test_reference_filtered_gff_queries_limit_coordinate_io() {
+        let directory = tempdir().expect("should create temporary directory");
+        let first = "chr1\tsrc\tgene\t10\t20\t.\t+\t.\tName=Shared";
+        let case_variant = "CHR1\tsrc\tgene\t30\t40\t.\t+\t.\tName=Shared";
+        let chr10 = "chr10\tsrc\tgene\t50\t60\t.\t+\t.\tName=Shared";
+        let chr1_alt = "chr1_alt\tsrc\tgene\t70\t80\t.\t+\t.\tName=Shared";
+        let second = "chr2\tsrc\tgene\t90\t100\t.\t+\t.\tName=Shared";
+        let (source, coordinate_index) = write_tbi_lines(
+            directory.path(),
+            "reference-filtered",
+            &[
+                "##gff-version 3",
+                first,
+                case_variant,
+                chr10,
+                chr1_alt,
+                second,
+            ],
+        );
+        let destination = directory.path().join("reference-filtered.gai");
+        build_name_index(
+            &source,
+            &coordinate_index,
+            &destination,
+            &NameIndexOptions::new(["Name"], false).unwrap(),
+        )
+        .expect("should build reference-filtered GAI");
+        let mut indexed = IndexedSource::open(&source, &coordinate_index, &destination)
+            .expect("should open reference-filtered source");
+
+        let (exact, exact_stats) = indexed
+            .query_on_contigs_with_mode_and_stats("shared", &["chr1"], MatchMode::Exact)
+            .expect("should query exact name on one reference");
+        assert_eq!(
+            exact
+                .iter()
+                .map(|record| record.raw_line.as_str())
+                .collect::<Vec<_>>(),
+            vec![first, case_variant]
+        );
+        assert_eq!(exact_stats.requested_spans, 2);
+        assert_eq!(exact_stats.distinct_span_blocks_decoded, 2);
+        assert_eq!(exact_stats.exact_interval_queries, 2);
+        assert_eq!(exact_stats.unique_candidate_records, 2);
+        assert_eq!(exact_stats.matching_records, 2);
+        assert!(exact_stats.bytes_read > 0);
+
+        let (mixed_case, mixed_case_stats) = indexed
+            .query_on_contigs_with_mode_and_stats("shared", &["cHr1"], MatchMode::Exact)
+            .expect("should match reference names without regard to case");
+        assert_eq!(mixed_case, exact);
+        assert_eq!(mixed_case_stats, exact_stats);
+
+        let (repeated, repeated_stats) = indexed
+            .query_on_contigs_with_mode_and_stats("shared", &["CHR1", "cHr1"], MatchMode::Exact)
+            .expect("should deduplicate case-insensitive reference matches");
+        assert_eq!(repeated, exact);
+        assert_eq!(repeated_stats, exact_stats);
+
+        for (reference, expected) in [("chr10", chr10), ("chr1_alt", chr1_alt)] {
+            let (records, _) = indexed
+                .query_on_contigs_with_mode_and_stats("shared", &[reference], MatchMode::Exact)
+                .expect("should match a full contig name");
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].raw_line, expected);
+        }
+
+        let (prefix, prefix_stats) = indexed
+            .query_on_contigs_with_mode_and_stats("sha", &["chr2"], MatchMode::Prefix)
+            .expect("should query name prefix on one reference");
+        assert_eq!(prefix.len(), 1);
+        assert_eq!(prefix[0].raw_line, second);
+        assert_eq!(prefix_stats.requested_spans, 1);
+        assert_eq!(prefix_stats.exact_interval_queries, 1);
+        assert_eq!(prefix_stats.unique_candidate_records, 1);
+
+        let (contains, contains_stats) = indexed
+            .query_on_contigs_with_mode_and_stats("har", &["chr1"], MatchMode::Contains)
+            .expect("should query name substring on one reference");
+        assert_eq!(contains, exact);
+        assert_eq!(contains_stats.requested_spans, 2);
+        assert_eq!(contains_stats.exact_interval_queries, 2);
+        assert_eq!(contains_stats.unique_candidate_records, 2);
+
+        for references in [&[][..], &["missing"][..]] {
+            let (records, stats) = indexed
+                .query_on_contigs_with_mode_and_stats("shared", references, MatchMode::Exact)
+                .expect("should accept empty or unknown reference filters");
+            assert!(records.is_empty());
+            assert_eq!(stats, QueryStats::default());
+        }
+
+        for references in [&["chr"][..], &["hr1"][..], &["chr1_"][..]] {
+            let (records, stats) = indexed
+                .query_on_contigs_with_mode_and_stats("shared", references, MatchMode::Exact)
+                .expect("should require an exact contig name");
+            assert!(records.is_empty());
+            assert_eq!(stats, QueryStats::default());
+        }
+
+        let case_sensitive_destination = directory.path().join("reference-filtered-sensitive.gai");
+        build_name_index(
+            &source,
+            &coordinate_index,
+            &case_sensitive_destination,
+            &NameIndexOptions::new(["Name"], true).unwrap(),
+        )
+        .expect("should build case-sensitive attribute GAI");
+        let mut case_sensitive =
+            IndexedSource::open(&source, &coordinate_index, &case_sensitive_destination)
+                .expect("should open case-sensitive attribute GAI");
+        let (records, _) = case_sensitive
+            .query_on_contigs_with_mode_and_stats("Shared", &["cHr1"], MatchMode::Exact)
+            .expect("contig matching should stay case-insensitive");
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.raw_line.as_str())
+                .collect::<Vec<_>>(),
+            vec![first, case_variant]
+        );
+    }
+
+    #[test]
+    #[cfg_attr(feature = "profiling", tracing::instrument(level = "trace", skip_all))]
     fn test_query_exact_spans_preserves_identical_records_and_overlap_order() {
         let directory = tempdir().expect("should create temporary directory");
         let first = "chr1\tsrc\tgene\t10\t20\t.\t+\t.\tName=overlap";

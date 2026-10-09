@@ -30,9 +30,25 @@
 //! let mut indexed = open_index(source, coordinate_index, index)?;
 //! let reusable_exact = indexed.query("BRCA1")?;
 //! let reusable_prefix = indexed.query_with_mode("BRCA", MatchMode::Prefix)?;
-//! // For performance counters, use the stats variant:
+//! let contig_exact = indexed.query_on_contigs("BRCA1", &["chr17"])?;
+//! let contig_prefix =
+//!     indexed.query_on_contigs_with_mode("BRCA", &["chr17"], MatchMode::Prefix)?;
+//! // Optional query statistics:
+//! // let (records, stats) = indexed.query_on_contigs_with_stats("BRCA1", &["chr17"])?;
+//! // let (records, stats) = indexed.query_on_contigs_with_mode_and_stats(
+//! //     "BRCA", &["chr17"], MatchMode::Prefix,
+//! // )?;
+//! // For whole-source performance counters, use the stats variant:
 //! // let (records, stats) = indexed.query_with_mode_and_stats("BRCA", MatchMode::Prefix)?;
-//! # let _ = (metadata, exact, prefix, reusable_exact, reusable_prefix);
+//! # let _ = (
+//! #     metadata,
+//! #     exact,
+//! #     prefix,
+//! #     reusable_exact,
+//! #     reusable_prefix,
+//! #     contig_exact,
+//! #     contig_prefix,
+//! # );
 //! # Ok(())
 //! # }
 //! ```

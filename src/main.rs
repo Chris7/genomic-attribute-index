@@ -125,6 +125,9 @@ struct QueryIndexArgs {
     /// Match values exactly, by prefix, by literal substring, or with a regex.
     #[arg(long = "match", value_enum, default_value_t = QueryMatch::Exact)]
     match_mode: QueryMatch,
+    /// Exact, case-insensitive contig name; may be repeated.
+    #[arg(long = "contig", value_name = "CONTIG")]
+    contigs: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -253,9 +256,21 @@ fn run(cli: Cli) -> Result<()> {
                 .gai
                 .unwrap_or_else(|| PathBuf::from(format!("{}.gai", arguments.input.display())));
             let mut indexed = IndexedSource::open(&arguments.input, coordinate_index, gai)?;
-            for record in
-                indexed.query_name_with_mode(&arguments.term, arguments.match_mode.into())?
-            {
+            let records = if arguments.contigs.is_empty() {
+                indexed.query_with_mode(&arguments.term, arguments.match_mode.into())?
+            } else {
+                let references = arguments
+                    .contigs
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>();
+                indexed.query_on_contigs_with_mode(
+                    &arguments.term,
+                    &references,
+                    arguments.match_mode.into(),
+                )?
+            };
+            for record in records {
                 println!("{}", record.raw_line);
             }
         }
