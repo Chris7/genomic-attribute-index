@@ -95,7 +95,7 @@ mod streaming;
 
 pub use index::*;
 pub use query::{IndexedSource, NameIndexReader};
-pub use sort::{SortFormat, sort_bed, sort_file, sort_gff};
+pub use sort::{SortFormat, open_annotation_reader, sort_bed, sort_file, sort_gff};
 pub use streaming::{
     compress_file, sort_and_compress_file, sort_bgzf_with_csi, write_bgzf_with_csi,
 };

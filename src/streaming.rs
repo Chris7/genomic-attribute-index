@@ -60,7 +60,7 @@ pub fn compress_file(
 
     let mut bgzf_writer = bgzf::io::Writer::new(output_temp.as_file_mut());
     let index = write_bgzf_with_csi(
-        crate::sort::open_reader(input_path)?,
+        crate::sort::open_annotation_reader(input_path)?,
         &mut bgzf_writer,
         format,
     )?;
@@ -74,23 +74,51 @@ pub fn compress_file(
     )
 }
 
-/// Sorts an annotation file into a BGZF writer while building its CSI index from the same output
+/// Sorts a buffered annotation input into BGZF while building its CSI index from the same output
 /// stream.
 ///
-/// The format is inferred from the input extension. Sorted annotation lines are indexed as they
-/// are written, so the source is read and sorted once and no sorted-text intermediate is created.
-/// GFF comments and directives are skipped for indexing, and the sequence payload after
-/// `##FASTA` is streamed without line buffering. The caller must finish `writer` before using or
-/// serializing the returned index.
-pub fn sort_bgzf_with_csi<W: Write>(
-    input_path: impl AsRef<Path>,
-    disk_sort: bool,
+/// `reader` must provide decoded text and implement [`BufRead`], but it does not need to support
+/// seeking. The `format` is explicit because the stream has no path from which to infer it. The
+/// BGZF `writer` may wrap any [`Write`] implementation and does not need to support seeking.
+/// Sorted annotation lines are indexed as they are written, so no sorted-text intermediate is
+/// created. GFF comments and directives are skipped for indexing, and the sequence payload after
+/// `##FASTA` is streamed without line buffering. Finish `writer` before serializing or using the
+/// returned CSI index.
+///
+/// ```
+/// use std::io::{Cursor, Write};
+/// use gai::{SortFormat, sort_bgzf_with_csi};
+/// use noodles::{bgzf, csi};
+///
+/// # fn main() -> gai::Result<()> {
+/// let input = b"chr1\tsource\tgene\t1\t2\t.\t+\t.\tName=example\n";
+/// let mut writer = bgzf::io::Writer::new(Vec::new());
+/// let index = sort_bgzf_with_csi(
+///     Cursor::new(input.as_slice()),
+///     &mut writer,
+///     SortFormat::Gff,
+///     false,
+/// )?;
+/// let compressed = writer.finish()?;
+/// let mut csi_bytes = Vec::new();
+/// let mut csi_writer = csi::io::Writer::new(&mut csi_bytes);
+/// csi_writer.write_index(&index)?;
+/// csi_writer.into_inner().finish()?.flush()?;
+/// let _ = (compressed, csi_bytes);
+/// # Ok(())
+/// # }
+/// ```
+pub fn sort_bgzf_with_csi<R: BufRead, W: Write>(
+    reader: R,
     writer: &mut bgzf::io::Writer<W>,
+    format: SortFormat,
+    disk_sort: bool,
 ) -> Result<csi::Index> {
-    let input_path = input_path.as_ref();
-    let format = SortFormat::from_path(input_path)?;
     let mut output = SortIndexingWriter::new(writer, format);
-    let sort_result = crate::sort::sort_file(input_path, disk_sort, &mut output);
+    let sort_result = match format {
+        SortFormat::Gff => crate::sort::sort_gff(reader, disk_sort, &mut output),
+        SortFormat::Bed => crate::sort::sort_bed(reader, disk_sort, &mut output),
+    };
 
     if let Some(error) = output.index_error.take() {
         return Err(error);
@@ -114,10 +142,12 @@ pub fn sort_and_compress_file(
     let output_path = output_path.as_ref();
     let coordinate_index_path = coordinate_index_path_for(output_path, coordinate_index_path);
     validate_output_paths(input_path, output_path, &coordinate_index_path)?;
+    let format = SortFormat::from_path(input_path)?;
+    let reader = crate::sort::open_annotation_reader(input_path)?;
 
     let (mut output_temp, index_temp) = temporary_outputs(output_path, &coordinate_index_path)?;
     let mut bgzf_writer = bgzf::io::Writer::new(output_temp.as_file_mut());
-    let index = sort_bgzf_with_csi(input_path, disk_sort, &mut bgzf_writer)?;
+    let index = sort_bgzf_with_csi(reader, &mut bgzf_writer, format, disk_sort)?;
     bgzf_writer.finish()?.flush()?;
 
     publish_outputs(

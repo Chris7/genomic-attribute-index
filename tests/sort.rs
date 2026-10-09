@@ -1,14 +1,14 @@
 use std::{
     fs,
-    io::{Cursor, Read},
+    io::{BufReader, Cursor, Read},
     path::{Path, PathBuf},
     process::Command,
 };
 
 use flate2::read::MultiGzDecoder;
 use gai::{
-    BuildOptions, NameIndexOptions, build_name_index_with_options, query_index, sort_bed,
-    sort_file, sort_gff,
+    BuildOptions, NameIndexOptions, SortFormat, build_name_index_with_options, query_index,
+    sort_bed, sort_bgzf_with_csi, sort_file, sort_gff,
 };
 use noodles::{
     bgzf,
@@ -16,6 +16,14 @@ use noodles::{
     csi::{self, BinningIndex},
 };
 use tempfile::tempdir;
+
+struct ReadOnlyReader(Cursor<Vec<u8>>);
+
+impl Read for ReadOnlyReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(buffer)
+    }
+}
 
 fn lines(output: Vec<u8>) -> Vec<String> {
     String::from_utf8(output)
@@ -52,6 +60,17 @@ fn query_csi(source: &[u8], index_bytes: &[u8], region: &str) -> Vec<u8> {
         })
         .collect::<Vec<_>>()
         .concat()
+}
+
+fn serialize_csi(index: &csi::Index) -> Vec<u8> {
+    let mut output = Vec::new();
+    let mut writer = csi::io::Writer::new(&mut output);
+    writer.write_index(index).expect("should write CSI index");
+    writer
+        .into_inner()
+        .finish()
+        .expect("should finish CSI index");
+    output
 }
 
 #[test]
@@ -116,6 +135,68 @@ fn gff_parent_hierarchy_does_not_override_coordinate_order() {
             "chr1\ts\texon\t10\t20\t.\t+\t.\tID=child;Parent=gene",
             "chr1\ts\tgene\t30\t40\t.\t+\t.\tID=gene",
         ]
+    );
+}
+
+#[test]
+fn rust_sort_bgzf_with_csi_accepts_non_seekable_streams() {
+    let long_value = "x".repeat(70 * 1024);
+    let gff = format!(
+        "chr2\ts\tgene\t600000000\t600000010\t.\t+\t.\tName=second-contig\n\
+         chr1\ts\tgene\t1\t2\t.\t+\t.\tName=cross-block;Note={long_value}\n\
+         chr1\ts\tgene\t600000000\t600000010\t.\t+\t.\tName=after-block\n"
+    );
+    let mut compressed_gff = Vec::new();
+    let mut gff_writer = bgzf::io::Writer::new(&mut compressed_gff);
+    let gff_index = sort_bgzf_with_csi(
+        BufReader::new(ReadOnlyReader(Cursor::new(gff.as_bytes().to_vec()))),
+        &mut gff_writer,
+        SortFormat::Gff,
+        true,
+    )
+    .expect("should sort and index a non-seekable GFF reader");
+    gff_writer
+        .finish()
+        .expect("should finish compressed GFF output");
+    let gff_index = serialize_csi(&gff_index);
+    assert!(
+        String::from_utf8_lossy(&query_csi(&compressed_gff, &gff_index, "chr1:1-2"))
+            .contains("Name=cross-block")
+    );
+    assert!(
+        String::from_utf8_lossy(&query_csi(
+            &compressed_gff,
+            &gff_index,
+            "chr1:600000000-600000010"
+        ))
+        .contains("Name=after-block")
+    );
+
+    let bed = b"chr2\t600000000\t600000010\tsecond-contig\nchr1\t0\t5\tfirst\n";
+    let mut compressed_bed = Vec::new();
+    let mut bed_writer = bgzf::io::Writer::new(&mut compressed_bed);
+    let bed_index = sort_bgzf_with_csi(
+        BufReader::new(ReadOnlyReader(Cursor::new(bed.to_vec()))),
+        &mut bed_writer,
+        SortFormat::Bed,
+        true,
+    )
+    .expect("should sort and index a non-seekable BED reader");
+    bed_writer
+        .finish()
+        .expect("should finish compressed BED output");
+    let bed_index = serialize_csi(&bed_index);
+    assert!(
+        String::from_utf8_lossy(&query_csi(&compressed_bed, &bed_index, "chr1:1-5"))
+            .contains("first")
+    );
+    assert!(
+        String::from_utf8_lossy(&query_csi(
+            &compressed_bed,
+            &bed_index,
+            "chr2:600000001-600000010"
+        ))
+        .contains("second-contig")
     );
 }
 

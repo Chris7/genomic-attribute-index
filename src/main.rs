@@ -7,8 +7,8 @@ use std::{
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use gai::{
     BuildOptions, IndexedSource, MatchMode, NameIndexOptions, Result, SortFormat,
-    build_name_index_with_options, compress_file, sort_and_compress_file, sort_bgzf_with_csi,
-    sort_file,
+    build_name_index_with_options, compress_file, open_annotation_reader, sort_and_compress_file,
+    sort_bgzf_with_csi, sort_file,
 };
 use noodles::csi;
 use tempfile::NamedTempFile;
@@ -252,7 +252,9 @@ fn run(cli: Cli) -> Result<()> {
                 let index_temp = stage_csi_path(index_path)?;
                 let stdout = std::io::stdout();
                 let mut writer = noodles::bgzf::io::Writer::new(stdout.lock());
-                let index = sort_bgzf_with_csi(&arguments.input, arguments.disk_sort, &mut writer)?;
+                let format = SortFormat::from_path(&arguments.input)?;
+                let reader = open_annotation_reader(&arguments.input)?;
+                let index = sort_bgzf_with_csi(reader, &mut writer, format, arguments.disk_sort)?;
                 writer.finish()?.flush()?;
                 publish_csi_index(&index, index_temp, index_path)?;
             } else {
