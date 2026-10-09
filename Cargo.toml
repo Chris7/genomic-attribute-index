@@ -47,6 +47,10 @@ flate2 = { version = "1.1.10", default-features = false, features = ["zlib-rs"] 
 natord = "1.0.9"
 tempfile = "3.20"
 
+[dev-dependencies]
+libc = "0.2"
+rmp-serde = "1.3"
+
 [features]
 default = []
 profiling = ["dep:pprof", "dep:tracing", "dep:tracing-subscriber"]

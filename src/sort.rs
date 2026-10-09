@@ -3,12 +3,13 @@
 use std::{
     cmp::Ordering,
     collections::{BTreeSet, HashMap, HashSet},
+    error::Error as StdError,
     fs::File,
     io::{self, BufRead, BufReader, Cursor, Write},
     path::Path,
 };
 
-use ext_sort::{ExternalSorter, ExternalSorterBuilder, LimitedBufferBuilder};
+use ext_sort::{ExternalSorter, ExternalSorterBuilder, LimitedBufferBuilder, SortError};
 use flate2::bufread::MultiGzDecoder;
 use noodles::gff::{self, record::attributes::field::Value as GffAttributeValue};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -148,6 +149,82 @@ where
     })
 }
 
+#[derive(Debug)]
+struct TemporaryStorageSortError {
+    temporary_directory: std::path::PathBuf,
+    cause: io::Error,
+    source: Box<dyn StdError + Send + Sync>,
+}
+
+impl std::fmt::Display for TemporaryStorageSortError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "temporary storage limit reached while sorting annotations under {}: {}. Check available disk space, quota, or filesystem file-size limits",
+            self.temporary_directory.display(),
+            self.cause
+        )
+    }
+}
+
+impl StdError for TemporaryStorageSortError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+fn temporary_storage_cause(error: &(dyn StdError + 'static)) -> Option<io::Error> {
+    let mut source = Some(error);
+
+    while let Some(error) = source {
+        if let Some(io_error) = error.downcast_ref::<io::Error>()
+            && matches!(
+                io_error.kind(),
+                io::ErrorKind::StorageFull
+                    | io::ErrorKind::QuotaExceeded
+                    | io::ErrorKind::FileTooLarge
+            )
+        {
+            return Some(match io_error.raw_os_error() {
+                Some(code) => io::Error::from_raw_os_error(code),
+                None => io::Error::new(io_error.kind(), io_error.to_string()),
+            });
+        }
+
+        source = error.source();
+    }
+
+    None
+}
+
+fn map_sort_error<S, D, I>(error: SortError<S, D, I>) -> Error
+where
+    S: StdError + Send + Sync + 'static,
+    D: StdError + Send + Sync + 'static,
+    I: StdError + Send + Sync + 'static,
+{
+    let cause = match &error {
+        SortError::TempDir(error) => temporary_storage_cause(error),
+        SortError::IO(error) => temporary_storage_cause(error),
+        SortError::SerializationError(error) => temporary_storage_cause(error),
+        SortError::ThreadPoolBuildError(_)
+        | SortError::DeserializationError(_)
+        | SortError::InputError(_) => None,
+    };
+
+    if let Some(cause) = cause {
+        let error_kind = cause.kind();
+        let context = TemporaryStorageSortError {
+            temporary_directory: tempfile::env::temp_dir(),
+            cause,
+            source: Box::new(error),
+        };
+        Error::Io(io::Error::new(error_kind, context))
+    } else {
+        Error::Io(io::Error::other(error))
+    }
+}
+
 /// Sort records either in memory or externally on disk.
 ///
 /// The input is consumed completely before this function returns, so callers
@@ -172,9 +249,9 @@ where
             true,
         ))
         .build()
-        .map_err(io::Error::other)?;
+        .map_err(map_sort_error)?;
 
-    let records = sorter.sort_by(records, compare).map_err(io::Error::other)?;
+    let records = sorter.sort_by(records, compare).map_err(map_sort_error)?;
 
     Ok(Box::new(
         records.map(|record| record.map_err(io::Error::other)),
@@ -707,11 +784,15 @@ fn invalid_line(format: &str, line_number: usize, message: impl Into<String>) ->
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Cursor, Error as IoError};
+    use std::{
+        error::Error as StdError,
+        io::{self, Cursor, Error as IoError, Write},
+    };
 
+    use ext_sort::SortError;
     use noodles::gff;
 
-    use super::{parse_gff_record, sort_bed, sort_gff};
+    use super::{map_sort_error, parse_gff_record, sort_bed, sort_gff};
 
     type Relationships = (Vec<Vec<u8>>, Vec<Vec<u8>>);
 
@@ -890,6 +971,143 @@ mod tests {
                 "the streaming parser should reject {description}"
             );
         }
+    }
+
+    struct FailingWriter {
+        error: Option<io::Error>,
+    }
+
+    impl Write for FailingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if bytes.len() > 1024 {
+                return Err(self.error.take().expect("should fail one large write"));
+            }
+
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn large_gff_sort_record() -> super::GffSortRecord {
+        let mut raw = b"chr1\tsource\tgene\t1\t2\t.\t+\t.\tName=".to_vec();
+        raw.extend(vec![b'a'; 16 * 1024]);
+        parse_gff_record(raw, 1).expect("should parse the large GFF record")
+    }
+
+    #[cfg(unix)]
+    fn source_os_error(error: &(dyn StdError + 'static)) -> Option<i32> {
+        let mut source = Some(error);
+
+        while let Some(error) = source {
+            if let Some(io_error) = error.downcast_ref::<io::Error>()
+                && let Some(code) = io_error.raw_os_error()
+            {
+                return Some(code);
+            }
+
+            source = error.source();
+        }
+
+        None
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_sort_error_reports_enospc_and_edquot_from_messagepack_writes() {
+        let record = large_gff_sort_record();
+        let cases = [
+            (libc::ENOSPC, "No space left on device"),
+            (libc::EDQUOT, "Disk quota exceeded"),
+            (libc::EFBIG, "File too large"),
+        ];
+
+        for (code, message) in cases {
+            let mut writer = FailingWriter {
+                error: Some(io::Error::from_raw_os_error(code)),
+            };
+            let serialization_error = rmp_serde::encode::write(&mut writer, &record)
+                .expect_err("should fail while serializing the large raw GFF record");
+            let sort_error = SortError::<
+                rmp_serde::encode::Error,
+                rmp_serde::decode::Error,
+                io::Error,
+            >::SerializationError(serialization_error);
+
+            let error = map_sort_error(sort_error);
+
+            assert!(
+                matches!(&error, crate::Error::Io(io_error) if io_error.kind() == io::Error::from_raw_os_error(code).kind()),
+                "storage failures should remain I/O errors with the storage-full kind"
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains("temporary storage limit reached"),
+                "the public error should identify exhausted temporary storage"
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains(&tempfile::env::temp_dir().display().to_string()),
+                "the public error should identify the temporary directory"
+            );
+            assert!(
+                error.to_string().contains(message),
+                "the public error should retain the operating-system cause"
+            );
+            assert_eq!(
+                source_os_error(&error),
+                Some(code),
+                "the original operating-system error code should remain in the source chain"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sort_error_does_not_relabel_non_storage_serialization_errors() {
+        let record = large_gff_sort_record();
+        let mut writer = FailingWriter {
+            error: Some(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "injected writer failure",
+            )),
+        };
+        let serialization_error = rmp_serde::encode::write(&mut writer, &record)
+            .expect_err("should fail while serializing the large raw GFF record");
+        let sort_error = SortError::<
+            rmp_serde::encode::Error,
+            rmp_serde::decode::Error,
+            io::Error,
+        >::SerializationError(serialization_error);
+
+        let error = map_sort_error(sort_error);
+
+        assert!(
+            matches!(&error, crate::Error::Io(io_error) if io_error.kind() == io::ErrorKind::Other),
+            "unrelated serialization errors should retain their ordinary I/O wrapper"
+        );
+        assert!(
+            !error
+                .to_string()
+                .contains("temporary storage limit reached"),
+            "unrelated writer failures must not be reported as storage exhaustion"
+        );
+    }
+
+    #[test]
+    fn test_sort_error_does_not_relabel_malformed_input_errors() {
+        let error = sort_gff(Cursor::new(b"invalid\n"), true, Vec::new())
+            .expect_err("malformed GFF input should fail sorting");
+
+        assert!(
+            !error
+                .to_string()
+                .contains("temporary storage limit reached"),
+            "input errors must not be reported as temporary storage exhaustion"
+        );
     }
 
     fn gff_record_line(score: &str, strand: &str, phase: &str, attributes: &str) -> Vec<u8> {
