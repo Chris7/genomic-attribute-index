@@ -34,7 +34,7 @@ ext-sort = { version = "^0.1.5" }
 crc32fast = "1.4"
 fst = "0.4"
 memmap2 = "0.9"
-noodles = { version = "0.101", features = ["bgzf", "core", "csi", "gff", "tabix"] }
+noodles = { version = "0.101", features = ["bed", "bgzf", "core", "csi", "gff", "tabix"] }
 rayon = "1.11"
 regex = "1.12"
 serde = { version = "1", features = ["derive"] }
@@ -45,6 +45,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["r
 zstd = "0.13"
 flate2 = { version = "1.1.10", default-features = false, features = ["zlib-rs"] }
 natord = "1.0.9"
+tempfile = "3.20"
 
 [features]
 default = []
@@ -52,9 +53,6 @@ profiling = ["dep:pprof", "dep:tracing", "dep:tracing-subscriber"]
 
 [target.'cfg(unix)'.dependencies]
 pprof = { version = "0.15", default-features = false, optional = true }
-
-[dev-dependencies]
-tempfile = "3.20"
 
 [[bench]]
 name = "compression"

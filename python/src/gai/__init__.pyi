@@ -130,4 +130,10 @@ def query_index(
     *,
     match: MatchMode = "exact",
 ) -> list[GffRecord]: ...
+def compress(
+    input: PathLike,
+    output: PathLike,
+    *,
+    coordinate_index: Optional[PathLike] = ...,
+) -> None: ...
 def inspect_index(gai: PathLike) -> IndexMetadata: ...

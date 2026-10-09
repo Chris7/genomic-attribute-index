@@ -40,6 +40,63 @@ def test_sort(fixture_paths, tmp_path):
     assert expected == results
 
 
+@pytest.mark.parametrize(
+    ("extension", "source_text", "term", "custom_coordinate_index"),
+    [
+        (
+            "gff3",
+            "##gff-version 3\n"
+            "chr1\tsrc\tgene\t600000001\t600000010\t.\t+\t.\tName=LargeGene\n",
+            "LargeGene",
+            False,
+        ),
+        ("bed", "chr1\t600000000\t600000010\tLargeBed\n", "LargeBed", True),
+    ],
+)
+def test_compress_builds_csi_for_large_gff_and_bed(
+    extension, source_text, term, custom_coordinate_index, tmp_path
+):
+    source = tmp_path / f"large.{extension}"
+    output = tmp_path / f"large.{extension}.gz"
+    source.write_text(source_text)
+    custom_index = tmp_path / f"custom.{extension}.csi"
+    if custom_coordinate_index:
+        gai.compress(source, output, coordinate_index=custom_index)
+        coordinate_index = custom_index
+        assert not Path(f"{output}.csi").exists()
+    else:
+        gai.compress(source, output)
+        coordinate_index = Path(f"{output}.csi")
+
+    assert output.exists()
+    assert coordinate_index.exists()
+    assert not Path(f"{output}.tbi").exists()
+    with gzip.open(output, "rt") as handle:
+        assert handle.read() == source_text
+
+    destination = tmp_path / f"large.{extension}.gai"
+    attributes = ["Name"] if extension == "gff3" else []
+    gai.build_index(output, coordinate_index, destination, attributes)
+    records = gai.query_index(output, coordinate_index, destination, term)
+    assert len(records) == 1
+    assert term in records[0].raw_line
+
+
+def test_compress_rejects_unsorted_source_without_publishing_outputs(tmp_path):
+    source = tmp_path / "unsorted.gff3"
+    output = tmp_path / "unsorted.gff3.gz"
+    source.write_text(
+        "chr1\tsrc\tgene\t20\t30\t.\t+\t.\tName=Later\n"
+        "chr1\tsrc\tgene\t10\t15\t.\t+\t.\tName=Earlier\n"
+    )
+
+    with pytest.raises(gai.GaiInputError, match="sorted"):
+        gai.compress(source, output)
+
+    assert not output.exists()
+    assert not Path(f"{output}.csi").exists()
+
+
 def test_build_query_inspect_tbi_and_source_order(fixture_paths, tmp_path):
     destination = tmp_path / "fixture.gai"
     stats = _build(fixture_paths, destination)
