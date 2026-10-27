@@ -55,7 +55,7 @@ fn hex(bytes: &[u8; 32]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-#[pyclass(name = "GffRecord", frozen)]
+#[pyclass(name = "GffRecord", frozen, from_py_object)]
 #[derive(Clone)]
 struct PyGffRecord {
     #[pyo3(get)]
@@ -115,7 +115,7 @@ impl PyGffRecord {
     }
 }
 
-#[pyclass(name = "IndexMetadata", frozen)]
+#[pyclass(name = "IndexMetadata", frozen, from_py_object)]
 #[derive(Clone)]
 struct PyIndexMetadata {
     #[pyo3(get)]
@@ -223,7 +223,7 @@ impl From<IndexMetadata> for PyIndexMetadata {
     }
 }
 
-#[pyclass(name = "BuildStats", frozen)]
+#[pyclass(name = "BuildStats", frozen, from_py_object)]
 #[derive(Clone)]
 struct PyBuildStats {
     #[pyo3(get)]
@@ -328,7 +328,7 @@ impl From<IndexStats> for PyBuildStats {
     }
 }
 
-#[pyclass(name = "QueryStats", frozen)]
+#[pyclass(name = "QueryStats", frozen, from_py_object)]
 #[derive(Clone)]
 struct PyQueryStats {
     #[pyo3(get)]
@@ -402,7 +402,7 @@ impl PyIndexedSource {
     fn query(&self, py: Python<'_>, term: &str, r#match: &str) -> PyResult<Vec<PyGffRecord>> {
         let term = term.to_owned();
         let match_mode = parse_match_mode(r#match).map_err(to_py_error)?;
-        let result = py.allow_threads(|| {
+        let result = py.detach(|| {
             let mut guard = self
                 .inner
                 .lock()
@@ -422,7 +422,7 @@ impl PyIndexedSource {
     ) -> PyResult<(Vec<PyGffRecord>, PyQueryStats)> {
         let term = term.to_owned();
         let match_mode = parse_match_mode(r#match).map_err(to_py_error)?;
-        let result = py.allow_threads(|| {
+        let result = py.detach(|| {
             let mut guard = self
                 .inner
                 .lock()
@@ -442,7 +442,7 @@ impl PyIndexedSource {
 #[pyfunction]
 #[pyo3(signature = (input, output, *, disk_sort=false))]
 fn sort(py: Python<'_>, input: PathBuf, output: PathBuf, disk_sort: bool) -> PyResult<()> {
-    py.allow_threads(|| -> Result<(), Error> {
+    py.detach(|| -> Result<(), Error> {
         let output = File::create(output)?;
         let mut writer = BufWriter::new(output);
         sort_file(input, disk_sort, &mut writer)?;
@@ -460,7 +460,7 @@ fn compress(
     output: PathBuf,
     coordinate_index: Option<PathBuf>,
 ) -> PyResult<()> {
-    py.allow_threads(move || compress_file(input, output, coordinate_index.as_deref()))
+    py.detach(move || compress_file(input, output, coordinate_index.as_deref()))
         .map_err(to_py_error)
 }
 
@@ -503,7 +503,7 @@ fn build_index(
     if let Some(threads) = bgzf_threads {
         build_options = build_options.with_bgzf_threads(threads);
     }
-    py.allow_threads(|| {
+    py.detach(|| {
         build_name_index_with_options(input, coordinate_index, output, &options, &build_options)
     })
     .map(PyBuildStats::from)
@@ -517,7 +517,7 @@ fn open_index(
     coordinate_index: PathBuf,
     gai: PathBuf,
 ) -> PyResult<PyIndexedSource> {
-    py.allow_threads(|| open_inner(input, coordinate_index, gai))
+    py.detach(|| open_inner(input, coordinate_index, gai))
         .map(|inner| PyIndexedSource {
             inner: Mutex::new(inner),
         })
@@ -535,7 +535,7 @@ fn query_index(
     r#match: &str,
 ) -> PyResult<Vec<PyGffRecord>> {
     let match_mode = parse_match_mode(r#match).map_err(to_py_error)?;
-    py.allow_threads(|| {
+    py.detach(|| {
         let mut indexed = open_inner(input, coordinate_index, gai)?;
         indexed.query_name_with_mode(&term, match_mode)
     })
@@ -545,7 +545,7 @@ fn query_index(
 
 #[pyfunction]
 fn inspect_index(py: Python<'_>, gai: PathBuf) -> PyResult<PyIndexMetadata> {
-    py.allow_threads(|| gai::NameIndexReader::open(gai).map(|reader| reader.inspect()))
+    py.detach(|| gai::NameIndexReader::open(gai).map(|reader| reader.inspect()))
         .map(Into::into)
         .map_err(to_py_error)
 }

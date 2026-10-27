@@ -246,7 +246,7 @@ where
             } else {
                 usize::MAX
             },
-            true,
+            disk_sort,
         ))
         .build()
         .map_err(map_sort_error)?;
